@@ -3,6 +3,7 @@
 - https://x.com/karpathy/status/1789666350878601581
 
 - https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html
+- https://docs.pytorch.org/cppdocs/index.html
 - https://pybind11.readthedocs.io/en/stable/index.html
 - https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-reference
 - https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions
