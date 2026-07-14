@@ -1,3 +1,19 @@
+## TODO
+
+- [ ] Find a way to measure execution time. From python or in C++? What about using ncu?
+
+## Roadmap
+
+- naive fused
+- flash-attn optimizations
+- matmul optimizations
+- mma
+- fp8
+
+- KV cache update?
+
+Compare against flash-attention decoding, FlashMLA doesn't support Ada.
+
 ## References
 
 - https://x.com/karpathy/status/1789666350878601581
@@ -17,6 +33,7 @@
 - https://github.com/NVIDIA/cutlass#documentation
 - https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html
 - https://developer.nvidia.com/blog/cutlass-linear-algebra-cuda/
+. https://www.nvidia.com/en-us/on-demand/session/gtcsiliconvalley2018-s8854/
 - https://www.nvidia.com/en-us/on-demand/session/gtcsj20-s21745/
 
 - https://mlc.ai/modern-gpu-programming-for-mlsys/index.html
