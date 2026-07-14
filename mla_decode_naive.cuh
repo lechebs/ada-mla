@@ -54,7 +54,7 @@ __global__ void mla_decode_naive_softmax(float *A, int n)
     }
 }
 
-template<bool transb> // Whether B is transposed
+template<int Tm, int Tn, int Tk, bool transb> // Whether B is transposed
 __global__ void mla_decode_naive_gemm(const float *A,
                                       const float *B,
                                       float *O,
@@ -70,9 +70,38 @@ __global__ void mla_decode_naive_gemm(const float *A,
         return;
     }
 
+    __shared__ float As[Tm * Tk];
+    __shared__ float Bs[Tk * Tn];
+
     float tmp = 0.0f;
-    for (int kk = 0; kk < k; ++kk) {
-        tmp += A[y * k + kk] * (transb ? B[x * k + kk] : B[kk * n + x]);
+    for (int kk = 0; kk < k; kk += Tk) {
+
+        // Assumes tiles are of the same size of the block
+        As[threadIdx.y * Tk + threadIdx.x] = A[y * k + kk + threadIdx.x];
+
+        /*
+        Bs[threadIdx.y * Tn + threadIdx.x] =
+            (transb ? B[x * k + kk + threadIdx.y] : // WARNING: Non coalesced
+                      B[(kk + threadIdx.y) * n + x]);
+        */
+
+        if (transb) {
+            // Transpose when storing in shmem
+            Bs[threadIdx.x * Tn + threadIdx.y] =
+                B[(blockDim.x * blockIdx.x + threadIdx.y) * k +
+                    kk + threadIdx.x];
+        } else {
+            Bs[threadIdx.y * Tn + threadIdx.x] =
+                B[(kk + threadIdx.y) * n + x];
+        }
+
+        __syncthreads();
+
+        for (int tk = 0; tk < Tk; ++tk) {
+            tmp += As[threadIdx.y * Tk + tk] * Bs[tk * Tn + threadIdx.x];
+        }
+
+        __syncthreads();
     }
 
     O[y * n + x] = alpha * tmp;

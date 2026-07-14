@@ -80,7 +80,7 @@ void mla_decode_naive(const float *query,
                    (num_heads - 1) / gemm_block.y + 1);
 
      // Compute attn matrix A = softmax(QK^T)
-    mla_decode_naive_gemm<true><<<gemm_grid, gemm_block>>>(
+    mla_decode_naive_gemm<16, 16, 16, true><<<gemm_grid, gemm_block>>>(
         query, cache, attn, num_heads,
         seq_length, head_dim_c, 1.0 / sqrt(head_dim_c));
 
@@ -92,13 +92,18 @@ void mla_decode_naive(const float *query,
     gemm_grid.x = (head_dim_c - 1) / gemm_block.x + 1;
     gemm_grid.y = (num_heads - 1) / gemm_block.y + 1;
     // Project values O = AV
-    mla_decode_naive_gemm<false><<<gemm_grid, gemm_block>>>(
+    mla_decode_naive_gemm<16, 16, 16, false><<<gemm_grid, gemm_block>>>(
         attn, cache, out, num_heads, head_dim_c, seq_length);
 }
 
-void mla_decode_cublas()
+void mla_decode_fused(const float *query,
+                      const float *cache,
+                      float *out,
+                      int num_heads,
+                      int head_dim_c,
+                      int seq_length)
 {
-    // Materialize attn matrix but use cublas for the gemm
+    return mla_decode_fused
 }
 
 at::Tensor mla_decode(const at::Tensor &query,
@@ -116,11 +121,12 @@ at::Tensor mla_decode(const at::Tensor &query,
     const float *q_ptr = static_cast<float *>(query.data_ptr());
     const float *c_ptr = static_cast<float *>(cache.data_ptr());
 
-    // I need some kind of JIT if I want to use template kernels
-    mla_decode_naive(
-        q_ptr, c_ptr, o_ptr, dev, q_size[0], q_size[1], cache.size(0));
+    // I need some kind of JIT if I want to specialize kernels at runtime
 
     //mla_decode_cpu(q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
+
+    mla_decode_naive(
+        q_ptr, c_ptr, o_ptr, dev, q_size[0], q_size[1], cache.size(0));
 
     return out;
 }
