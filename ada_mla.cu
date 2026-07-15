@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "mla_decode_naive.cuh"
+#include "mla_decode_fused.cuh"
 
 void mla_decode_cpu(const float *query, // (num_heads, head_dim_c)
                     const float *cache, // (seq_length, head_dim_c)
@@ -103,7 +104,14 @@ void mla_decode_fused(const float *query,
                       int head_dim_c,
                       int seq_length)
 {
-    return mla_decode_fused
+    dim3 block(16, 16);
+    dim3 grid((head_dim_c - 1) / block.x + 1, (num_heads - 1) / block.y + 1);
+
+    mla_decode_fused<16, 16, 16><<<grid, block>>>(
+        query, cache, out, num_heads, seq_length, head_dim_c);
+
+    // Why is this not needed?
+    // cudaDeviceSynchronize();
 }
 
 at::Tensor mla_decode(const at::Tensor &query,
@@ -125,8 +133,11 @@ at::Tensor mla_decode(const at::Tensor &query,
 
     //mla_decode_cpu(q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
 
-    mla_decode_naive(
-        q_ptr, c_ptr, o_ptr, dev, q_size[0], q_size[1], cache.size(0));
+    //mla_decode_naive(
+    //    q_ptr, c_ptr, o_ptr, dev, q_size[0], q_size[1], cache.size(0));
+
+    mla_decode_fused(
+        q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
 
     return out;
 }
