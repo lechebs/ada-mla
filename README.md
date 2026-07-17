@@ -1,13 +1,49 @@
-## TODO
+## Fused tiling strategy
 
-- [ ] Find a way to measure execution time. From python or in C++? What about using ncu?
+
+                                                    +--------------+
+                                                    |//////////////|
+                CTileN                              +--------------+
+                +---+----------------+              |              |
+                |///| QTileK         |              |              |
+                +---+----------------+              |              |
+                |///|                |              |              |
+                |///|                |              |              |
+                |///|                |              |              |
+QTileK          +---+----------------+              +--------------+
++---+---------+ +---+----------------+  ^           +--------------+
+|///| QTileM  | |   | --->           |  |           |              |
++---+---------+ +---+----------------+ num_heads    +--------------+
+|             | |                    |  |           |              |
++-------------+ +--------------------+  v           +--------------+
+<---HeadDim---> <-----seq_length----->
+
+|   \
+|    \          |   \
+|     \         |    \
++------+        +----+      ^
+|//////|        |    |      |
+|//////|        |    |      |
++------+        +----+   QTileM=32
+|//////|        |    |      |
+|//////|        |    |      |
++------+        +----+      v
+
+<------>        <---->
+QTileK=16      CTileN=8
+
+HeadDim = 576
 
 ## Roadmap
 
 - naive fused
 - flash-attn optimizations
-- matmul optimizations
-- mma
+- gemm optimizations
+  - cutlass hierarchy
+  - vector loads
+  - shmem bank conflicts
+  - mma
+  - sw pipelining
 - fp8
 
 - KV cache update?

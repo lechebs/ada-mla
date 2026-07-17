@@ -14,7 +14,7 @@ module = load(
     verbose=True)
 
 NUM_HEADS = 128
-HEAD_DIM_C = 512
+HEAD_DIM_C = 576
 SEQ_LENGTH = 4096
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,20 +31,27 @@ def mla_decode_sdpa(q: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
                                             c[None, None, :, :],
                                             c[None, None, :, :])
 
-q = torch.rand((NUM_HEADS, HEAD_DIM_C)).to(DEVICE)
-c = torch.rand((SEQ_LENGTH, HEAD_DIM_C)).to(DEVICE)
+# TODO: Benchmark with different SEQ_LENGTH values
 
-out_ada = module.mla_decode(q, c)
-out_sdpa = mla_decode_sdpa(q, c)
+q = torch.normal(0, 1, size=(NUM_HEADS, HEAD_DIM_C)).to(DEVICE)
+c = torch.normal(0, 1, size=(SEQ_LENGTH, HEAD_DIM_C)).to(DEVICE)
+
+out_naive = module.mla_decode_naive(q, c)
+out_fused = module.mla_decode_fused(q, c)
 out_torch = mla_decode_torch(q, c)
 
-diff_torch = torch.abs(out_ada - out_torch)
-diff_sdpa = torch.abs(out_ada - out_sdpa)
-print(f"[torch] max={torch.max(diff_torch)}, mean={torch.mean(diff_torch)}")
-print(f"[sdpa] max={torch.max(diff_sdpa)}, mean={torch.mean(diff_sdpa)}")
+diff_naive = torch.abs(out_naive - out_torch)
+diff_fused = torch.abs(out_fused - out_torch)
+print(f"[naive] max={torch.max(diff_naive)}, mean={torch.mean(diff_naive)}")
+print(f"[fused] max={torch.max(diff_fused)}, mean={torch.mean(diff_fused)}")
 
-t_ada = Timer(
-    stmt="module.mla_decode(q, c)",
+t_naive = Timer(
+    stmt="module.mla_decode_naive(q, c)",
+    setup="from __main__ import module",
+    globals={"q": q, "c": c})
+
+t_fused = Timer(
+    stmt="module.mla_decode_fused(q, c)",
     setup="from __main__ import module",
     globals={"q": q, "c": c})
 
@@ -58,6 +65,7 @@ t_sdpa = Timer(
     setup="from __main__ import mla_decode_sdpa",
     globals={"q": q, "c": c})
 
-#print(t_ada.timeit(100))
-#print(t_torch.timeit(100))
-#print(t_sdpa.timeit(100))
+print(t_torch.timeit(100))
+print(t_sdpa.timeit(100))
+print(t_naive.timeit(100))
+print(t_fused.timeit(100))

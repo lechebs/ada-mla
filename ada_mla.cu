@@ -105,17 +105,17 @@ void mla_decode_fused(const float *query,
                       int seq_length)
 {
     dim3 block(16, 16);
-    dim3 grid((head_dim_c - 1) / block.x + 1, (num_heads - 1) / block.y + 1);
+    dim3 grid(1, (num_heads - 1) / 32 + 1);
 
-    mla_decode_fused<16, 16, 16><<<grid, block>>>(
-        query, cache, out, num_heads, seq_length, head_dim_c);
+    mla_decode_fused<32, 16, 8, 576><<<grid, block>>>(
+        query, cache, out, num_heads, seq_length);
 
     // Why is this not needed?
     // cudaDeviceSynchronize();
 }
 
-at::Tensor mla_decode(const at::Tensor &query,
-                      const at::Tensor &cache)
+at::Tensor mla_decode_naive_api(const at::Tensor &query,
+                                const at::Tensor &cache)
 {
     // TODO: Use TORCH_CHECK on sizes, dtype and device
     const c10::IntArrayRef q_size = query.sizes();
@@ -133,8 +133,28 @@ at::Tensor mla_decode(const at::Tensor &query,
 
     //mla_decode_cpu(q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
 
-    //mla_decode_naive(
-    //    q_ptr, c_ptr, o_ptr, dev, q_size[0], q_size[1], cache.size(0));
+    mla_decode_naive(
+        q_ptr, c_ptr, o_ptr, dev, q_size[0], q_size[1], cache.size(0));
+
+    return out;
+}
+
+at::Tensor mla_decode_fused_api(const at::Tensor &query,
+                                const at::Tensor &cache)
+{
+    // TODO: Refactor common logic with mla_decode_naive
+
+    // TODO: Use TORCH_CHECK on sizes, dtype and device
+    const c10::IntArrayRef q_size = query.sizes();
+    const at::Device dev = query.device();
+    // Set dtype and layout same as input tensors
+    at::TensorOptions options = at::TensorOptions().device(dev);
+    at::Tensor out = at::empty(q_size, options);
+
+    float *o_ptr = static_cast<float *>(out.data_ptr());
+    // TODO: Perhaps call .contiguous() on the inputs
+    const float *q_ptr = static_cast<float *>(query.data_ptr());
+    const float *c_ptr = static_cast<float *>(cache.data_ptr());
 
     mla_decode_fused(
         q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
@@ -144,5 +164,6 @@ at::Tensor mla_decode(const at::Tensor &query,
 
 PYBIND11_MODULE(ada_mla, m)
 {
-    m.def("mla_decode", &mla_decode);
+    m.def("mla_decode_naive", &mla_decode_naive_api);
+    m.def("mla_decode_fused", &mla_decode_fused_api);
 }
