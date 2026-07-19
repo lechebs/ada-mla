@@ -1,5 +1,7 @@
 #pragma once
 
+// Template args not strictly needed anymore since shmem is dynamic
+// but they're probably going to be useful to unroll some loops
 template<int QTileM, int QTileK, int CTileN, int HeadDim>
 __global__ void mla_decode_fused(const float *__restrict__ Q,
                                  const float *__restrict__ C,
@@ -12,13 +14,6 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     float *Qs = shmem;
     float *Cs = Qs + QTileM * HeadDim;
     float *Ps = Cs + HeadDim * CTileN;
-    //float *Os = Cs + HeadDim * CTileN;
-
-    /*
-    __shared__ float Qs[QTileM * QTileK];
-    __shared__ float Cs[HeadDim * CTileN];
-    __shared__ float Os[QTileM * HeadDim];
-    */
 
     /*
     for (int j = threadIdx.y * blockDim.x + threadIdx.x;
@@ -27,6 +22,9 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         Os[j] = 0.0f;
     }
     */
+
+    // WARNING: out is initialized with at::empty,
+    // while here I'm supposing is initialized with at::zeros
 
     for (int i = blockDim.x * threadIdx.y + threadIdx.x;
              i < QTileM * HeadDim;
@@ -51,10 +49,6 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         for (int j = threadIdx.y * blockDim.x + threadIdx.x;
                  j < CTileN * HeadDim;
                  j += blockDim.x * blockDim.y) {
-            // NOTE: Cs could be loaded in chunks of size (CTileN, QTileM),
-            // big enough to perform the matmul with the corresponding Qs
-            // tiles. However, make sure that the accesses remaing coalesced
-            // and that vector loads can be used.
             Cs[j] = C[C_j * HeadDim + j];
         }
 
@@ -67,16 +61,10 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         // Tiled loop over query cols
         for (int Q_j = 0; Q_j < HeadDim; Q_j += QTileK) {
 
-            // Enough threads in a block to assign one output
-            // to each one. From (16, 16) go to (32, 8) by assigning
-            // half of the threads in the block the upper half of As
-            const int A_i = threadIdx.y * 2 + (threadIdx.x >= blockDim.x / 2);
-            const int A_j = threadIdx.x % CTileN;
-
             for (int k = 0; k < QTileK; ++k) {
-                log += Qs[A_i * HeadDim + Q_j + k] *
+                log += Qs[threadIdx.y * HeadDim + Q_j + k] *
                        // Cs is transposed
-                       Cs[A_j * HeadDim + Q_j + k];
+                       Cs[threadIdx.x * HeadDim + Q_j + k];
             }
         }
 
@@ -110,33 +98,28 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
         __syncthreads();
 
-        // TODO: Make blocks (32, 8)
-        // Perhaps better to name these "O_tile_i" while
-        // "Q_tile_j" is actually "Q_j"
-        const int O_i = threadIdx.y * 2 + (threadIdx.x >= blockDim.x / 2);
-        const int O_j = threadIdx.x % CTileN;
-
         for (int j = 0; j < HeadDim; j += CTileN) {
 
             // Online softmax correction
-            O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] *= norm_coef;
+            O[(blockIdx.y * QTileM + threadIdx.y) * HeadDim +
+                j + threadIdx.x] *= norm_coef;
             //Os[O_i * HeadDim + j + O_j] *= norm_coef;
 
             for (int k = 0; k < CTileN; ++k) {
-                O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] +=
+                O[(blockIdx.y * QTileM + threadIdx.y) * HeadDim +
+                    j + threadIdx.x] +=
                 //Os[O_i * HeadDim + j + O_j] +=
-                    Ps[O_i * CTileN + k] * Cs[k * HeadDim + j + O_j];
+                    Ps[threadIdx.y * CTileN + k] *
+                    Cs[k * HeadDim + j + threadIdx.x];
             }
         }
 
         __syncthreads(); // Wait before reusing Cs
     }
 
-    const int O_i = threadIdx.y * 2 + (threadIdx.x >= QTileK / 2);
-    const int O_j = threadIdx.x % CTileN;
-
     for (int j = 0; j < HeadDim; j += CTileN) {
-        O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] /= prev_sum;
+        O[(blockIdx.y * QTileM + threadIdx.y) * HeadDim +
+            j + threadIdx.x] /= prev_sum;
         //O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] =
         //    Os[O_i * HeadDim + j + O_j] / prev_sum;
     }

@@ -35,6 +35,28 @@ QTileK=16      CTileN=8
 
 HeadDim = 576
 
+## Worklog
+
+Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread blocks of size `256`.
+
+
+|kernel|time (ms)|
+|:-----|--------:|
+|pytorch eager                                          |0.357|
+||
+|naive (non fused gemm [`QM=QK=CN=16`] + softmax)       | 1.91|
+||
+|fused (fully tiled)  [`QM=QK=CN=16`]                   |  ~30|
+| + (no C vertical tiling) [`QM=32` `QK=16` `CN=8`]     |19.29|
+| + (no Q horizontal tiling) [`QM=32` `QK=16` `CN=8`]   |14.27|
+| + [`QM=QK=CN=16`]                                     | 7.21|
+||
+|split-kv|
+
+- Using shmem to accumulate output results degrades performance apparently.
+- I think I've to quickly move to fp16, otherwise shmem isn't enough!
+- When the number of threads in the block is fixed to `256`, increasing CTileN while reducing QTileM is better (at least without split-kv), I guess because it exposes more block parallelism and reduces the number of iterations along C. It could also be due to less shmem bank conflicts. I initially chose a taller Q block since it could be better in terms of AI (right?).
+
 ## Roadmap
 
 - naive fused

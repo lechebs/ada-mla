@@ -4,7 +4,7 @@
 
 #include "mla_decode_naive.cuh"
 #include "mla_decode_fused.cuh"
-//#include "mla_decode_split_kv.cuh"
+#include "mla_decode_split_kv.cuh"
 
 void mla_decode_cpu(const float *query, // (num_heads, head_dim_c)
                     const float *cache, // (seq_length, head_dim_c)
@@ -105,18 +105,24 @@ void run_mla_decode_fused(const float *query,
                           int head_dim_c,
                           int seq_length)
 {
-    dim3 block(16, 16);
-    dim3 grid(1, (num_heads - 1) / 32 + 1);
+    // TODO: It's probably better if head_dim_c is known at compile time
 
-    int shmem_bytes = 92160 + 1024;
+    dim3 block(16, 16);
+    dim3 grid(1, (num_heads - 1) / block.y + 1);
+
+    // TODO: Compute size using input args
+    int shmem_bytes = 74752;
 
     // Dynamic shmem is required for allocations > 48KB
-    cudaFuncSetAttribute(mla_decode_fused<32, 16, 8, 576>,
+    cudaFuncSetAttribute(mla_decode_fused<16, 16, 16, 576>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          shmem_bytes);
 
-    mla_decode_fused<32, 16, 8, 576><<<grid, block, shmem_bytes>>>(
+    mla_decode_fused<16, 16, 16, 576><<<grid, block, shmem_bytes>>>(
         query, cache, out, num_heads, seq_length);
+
+    // Why is this not needed?
+    //cudaDeviceSynchronize();
 
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) {
@@ -124,9 +130,31 @@ void run_mla_decode_fused(const float *query,
                cudaGetErrorName(error),
                cudaGetErrorString(error));
     }
+}
 
-    // Why is this not needed?
-    //cudaDeviceSynchronize();
+void run_mla_decode_split_kv(const float *query,
+                             const float *cache,
+                             float *out,
+                             const at::Device &device,
+                             int num_heads,
+                             int head_dim_c,
+                             int seq_length)
+{
+    const int num_splits = 4;
+    // TODO: Pack into one tensor
+    at::Tensor splits_max = at::empty({ num_heads, num_splits }, device);
+    at::Tensor splits_sum = at::empty({ num_heads, num_splits }, device);
+    // Each split needs its own output tensor (note that out could be reused)
+    at::Tensor splits_out = at::empty(
+        { num_splits, num_heads, head_dim_c }, device);
+
+    float *splits_max_ptr = splits_max.data_ptr<float>();
+    float *splits_sum_ptr = splits_sum.data_ptr<float>();
+    float *splits_out_ptr = splits_out.data_ptr<float>();
+
+    //mla_decode_split_kv<><<<dim3(), dim3()>>>();
+
+    //mla_decode_combine<>
 }
 
 at::Tensor mla_decode_naive_api(const at::Tensor &query,
