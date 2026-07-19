@@ -4,6 +4,7 @@
 
 #include "mla_decode_naive.cuh"
 #include "mla_decode_fused.cuh"
+//#include "mla_decode_split_kv.cuh"
 
 void mla_decode_cpu(const float *query, // (num_heads, head_dim_c)
                     const float *cache, // (seq_length, head_dim_c)
@@ -63,13 +64,13 @@ void mla_decode_cpu(const float *query, // (num_heads, head_dim_c)
     delete tmp;
 }
 
-void mla_decode_naive(const float *query,
-                      const float *cache,
-                      float *out,
-                      const at::Device &device,
-                      int num_heads,
-                      int head_dim_c,
-                      int seq_length)
+void run_mla_decode_naive(const float *query,
+                          const float *cache,
+                          float *out,
+                          const at::Device &device,
+                          int num_heads,
+                          int head_dim_c,
+                          int seq_length)
 {
     // Materialize attn matrix
     auto options = at::TensorOptions().device(device);
@@ -97,21 +98,35 @@ void mla_decode_naive(const float *query,
         attn, cache, out, num_heads, head_dim_c, seq_length);
 }
 
-void mla_decode_fused(const float *query,
-                      const float *cache,
-                      float *out,
-                      int num_heads,
-                      int head_dim_c,
-                      int seq_length)
+void run_mla_decode_fused(const float *query,
+                          const float *cache,
+                          float *out,
+                          int num_heads,
+                          int head_dim_c,
+                          int seq_length)
 {
     dim3 block(16, 16);
     dim3 grid(1, (num_heads - 1) / 32 + 1);
 
-    mla_decode_fused<32, 16, 8, 576><<<grid, block>>>(
+    int shmem_bytes = 92160 + 1024;
+
+    // Dynamic shmem is required for allocations > 48KB
+    cudaFuncSetAttribute(mla_decode_fused<32, 16, 8, 576>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         shmem_bytes);
+
+    mla_decode_fused<32, 16, 8, 576><<<grid, block, shmem_bytes>>>(
         query, cache, out, num_heads, seq_length);
 
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("Error: %s (%s)\n",
+               cudaGetErrorName(error),
+               cudaGetErrorString(error));
+    }
+
     // Why is this not needed?
-    // cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 at::Tensor mla_decode_naive_api(const at::Tensor &query,
@@ -133,7 +148,7 @@ at::Tensor mla_decode_naive_api(const at::Tensor &query,
 
     //mla_decode_cpu(q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
 
-    mla_decode_naive(
+    run_mla_decode_naive(
         q_ptr, c_ptr, o_ptr, dev, q_size[0], q_size[1], cache.size(0));
 
     return out;
@@ -144,19 +159,16 @@ at::Tensor mla_decode_fused_api(const at::Tensor &query,
 {
     // TODO: Refactor common logic with mla_decode_naive
 
-    // TODO: Use TORCH_CHECK on sizes, dtype and device
     const c10::IntArrayRef q_size = query.sizes();
     const at::Device dev = query.device();
-    // Set dtype and layout same as input tensors
     at::TensorOptions options = at::TensorOptions().device(dev);
     at::Tensor out = at::empty(q_size, options);
 
     float *o_ptr = static_cast<float *>(out.data_ptr());
-    // TODO: Perhaps call .contiguous() on the inputs
     const float *q_ptr = static_cast<float *>(query.data_ptr());
     const float *c_ptr = static_cast<float *>(cache.data_ptr());
 
-    mla_decode_fused(
+    run_mla_decode_fused(
         q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
 
     return out;

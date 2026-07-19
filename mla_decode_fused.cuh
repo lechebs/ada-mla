@@ -1,18 +1,40 @@
 #pragma once
 
 template<int QTileM, int QTileK, int CTileN, int HeadDim>
-__global__ void mla_decode_fused(const float *Q,
-                                 const float *C,
-                                 float *O,
+__global__ void mla_decode_fused(const float *__restrict__ Q,
+                                 const float *__restrict__ C,
+                                 float *__restrict__ O,
                                  int M, // num_heads
                                  int N) // seq_length
 {
-    // Coordinates relative to the output tile
-    //const int x = blockDim.x * blockIdx.x + threadIdx.x;
-    //const int y = blockDim.y * blockIdx.y + threadIdx.y;
+    extern __shared__ float shmem[];
 
+    float *Qs = shmem;
+    float *Cs = Qs + QTileM * HeadDim;
+    float *Ps = Cs + HeadDim * CTileN;
+    //float *Os = Cs + HeadDim * CTileN;
+
+    /*
     __shared__ float Qs[QTileM * QTileK];
     __shared__ float Cs[HeadDim * CTileN];
+    __shared__ float Os[QTileM * HeadDim];
+    */
+
+    /*
+    for (int j = threadIdx.y * blockDim.x + threadIdx.x;
+             j < QTileM * HeadDim;
+             j += blockDim.x * blockDim.y) {
+        Os[j] = 0.0f;
+    }
+    */
+
+    for (int i = blockDim.x * threadIdx.y + threadIdx.x;
+             i < QTileM * HeadDim;
+             i += blockDim.x * blockDim.y) {
+        Qs[i] = Q[(QTileM * blockIdx.y) * HeadDim + i];
+    }
+
+    __syncthreads();
 
     float prev_max = 0.0f; // max logit of prev tile
     float prev_sum = 0.0f; // denominator of prev tile
@@ -45,16 +67,6 @@ __global__ void mla_decode_fused(const float *Q,
         // Tiled loop over query cols
         for (int Q_j = 0; Q_j < HeadDim; Q_j += QTileK) {
 
-            // The block size is (16, 16), load upper half of Qs,
-            // then lower half of Qs
-            for (int i = threadIdx.y; i < QTileM; i += blockDim.y) {
-                Qs[i * QTileK + threadIdx.x] =
-                    Q[(QTileM * blockIdx.y + i) * HeadDim +
-                      Q_j + threadIdx.x];
-            }
-
-            __syncthreads();
-
             // Enough threads in a block to assign one output
             // to each one. From (16, 16) go to (32, 8) by assigning
             // half of the threads in the block the upper half of As
@@ -62,12 +74,10 @@ __global__ void mla_decode_fused(const float *Q,
             const int A_j = threadIdx.x % CTileN;
 
             for (int k = 0; k < QTileK; ++k) {
-                log += Qs[A_i * QTileK + k] *
+                log += Qs[A_i * HeadDim + Q_j + k] *
                        // Cs is transposed
                        Cs[A_j * HeadDim + Q_j + k];
             }
-
-            __syncthreads();
         }
 
         log /= sqrtf(HeadDim);
@@ -75,7 +85,7 @@ __global__ void mla_decode_fused(const float *Q,
         // As long as CTileN <= 32, use warp shuffles to compute partial reduction
 
         float max = log;
-        // Butterfly reduction within half warp
+        // Butterfly reduction within quarter warp
         for (int s = CTileN >> 1; s > 0; s >>= 1) {
             max = fmaxf(max, __shfl_xor_sync(0xffffffff, max, s));
         }
@@ -95,8 +105,8 @@ __global__ void mla_decode_fused(const float *Q,
         prev_max = max;
         prev_sum = sum;
 
-        // Load exp logit to shmem, reuse Q
-        Qs[threadIdx.y * blockDim.x + threadIdx.x] = exp_log;
+        // Load exp logit to shmem
+        Ps[threadIdx.y * blockDim.x + threadIdx.x] = exp_log;
 
         __syncthreads();
 
@@ -110,10 +120,12 @@ __global__ void mla_decode_fused(const float *Q,
 
             // Online softmax correction
             O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] *= norm_coef;
+            //Os[O_i * HeadDim + j + O_j] *= norm_coef;
 
             for (int k = 0; k < CTileN; ++k) {
                 O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] +=
-                    Qs[O_i * CTileN + k] * Cs[k * HeadDim + j + O_j];
+                //Os[O_i * HeadDim + j + O_j] +=
+                    Ps[O_i * CTileN + k] * Cs[k * HeadDim + j + O_j];
             }
         }
 
@@ -125,5 +137,7 @@ __global__ void mla_decode_fused(const float *Q,
 
     for (int j = 0; j < HeadDim; j += CTileN) {
         O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] /= prev_sum;
+        //O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] =
+        //    Os[O_i * HeadDim + j + O_j] / prev_sum;
     }
 }
