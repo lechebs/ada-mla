@@ -28,7 +28,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
     for (int i = blockDim.x * threadIdx.y + threadIdx.x;
              i < QTileM * HeadDim;
-             i += blockDim.x * blockDim.y) {
+             i += QTileM * CTileN) {
         Qs[i] = Q[(QTileM * blockIdx.y) * HeadDim + i];
     }
 
@@ -41,24 +41,23 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     for (int C_j = 0; C_j < N; C_j += CTileN) {
 
         // Load Cs once, reuse it for the projection
-        // I have 16x16 blocks, so I need to load
-        // in chunks, note that C is transposed in memory
-        // Should I worry about transposing Cs? I guess not
+       // Should I worry about transposing Cs? I guess not
 
-        // The block size could be passed as template param
+        // Unrolling here increases performance,
+        // compiler does it automatically
+        // #pragma unroll 8
         for (int j = threadIdx.y * blockDim.x + threadIdx.x;
                  j < CTileN * HeadDim;
-                 j += blockDim.x * blockDim.y) {
+                 j += QTileM * CTileN) {
             Cs[j] = C[C_j * HeadDim + j];
         }
 
         __syncthreads();
 
-        // Qs tiles are (QTileM, QTileK) = (32, 16)
-        // Cs tiles are (CTileN, HeadDim) = (8, 576)
-
         float log = 0.0f; // Logit
         // Tiled loop over query cols
+        // TODO: At this point QTileK is not used, but it will
+        // be used to better parallelize across warps
         for (int Q_j = 0; Q_j < HeadDim; Q_j += QTileK) {
 
             for (int k = 0; k < QTileK; ++k) {

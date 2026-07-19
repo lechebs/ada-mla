@@ -107,25 +107,38 @@ void run_mla_decode_fused(const float *query,
 {
     // TODO: It's probably better if head_dim_c is known at compile time
 
-    dim3 block(16, 16);
+    const int q_tile_m = 8;
+    const int q_tile_k = 16;
+    const int c_tile_n = 32;
+
+    dim3 block(c_tile_n, q_tile_m);
     dim3 grid(1, (num_heads - 1) / block.y + 1);
 
     // TODO: Compute size using input args
-    int shmem_bytes = 74752;
+    int shmem_bytes = (q_tile_m * head_dim_c +
+                       c_tile_n * head_dim_c +
+                       q_tile_m * c_tile_n) * 4;
 
     // Dynamic shmem is required for allocations > 48KB
-    cudaFuncSetAttribute(mla_decode_fused<16, 16, 16, 576>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         shmem_bytes);
+    cudaError_t error = cudaFuncSetAttribute(
+        mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_bytes);
 
-    mla_decode_fused<16, 16, 16, 576><<<grid, block, shmem_bytes>>>(
-        query, cache, out, num_heads, seq_length);
+    if (error != cudaSuccess) {
+        printf("Error: %s (%s)\n",
+               cudaGetErrorName(error),
+               cudaGetErrorString(error));
+    }
+
+    mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576>
+        <<<grid, block, shmem_bytes>>>(
+            query, cache, out, num_heads, seq_length);
 
     // Why is this not needed?
     //cudaDeviceSynchronize();
 
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
+    if ((error = cudaGetLastError()) != cudaSuccess) {
         printf("Error: %s (%s)\n",
                cudaGetErrorName(error),
                cudaGetErrorString(error));
