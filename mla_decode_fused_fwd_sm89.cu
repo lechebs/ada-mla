@@ -1,0 +1,51 @@
+#include <cstdio>
+
+#include "mla_decode.hpp"
+#include "mla_decode_fused_fwd.cuh"
+
+void run_mla_decode_fused(const float *query,
+                          const float *cache,
+                          float *out,
+                          int num_heads,
+                          int head_dim_c,
+                          int seq_length)
+{
+    // TODO: Should I make head_dim_c known at compile time?
+
+    const int q_tile_m = 8;
+    const int q_tile_k = 16;
+    const int c_tile_n = 32;
+
+    dim3 block(c_tile_n, q_tile_m);
+    dim3 grid(1, (num_heads - 1) / block.y + 1);
+
+    int shmem_bytes = (q_tile_m * head_dim_c +
+                       c_tile_n * head_dim_c +
+                       q_tile_m * c_tile_n) * 4;
+
+    // Dynamic shmem is required for allocations > 48KB
+    cudaError_t error = cudaFuncSetAttribute(
+        mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_bytes);
+
+    if (error != cudaSuccess) {
+        printf("Error: %s (%s)\n",
+               cudaGetErrorName(error),
+               cudaGetErrorString(error));
+    }
+
+    mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576>
+        <<<grid, block, shmem_bytes>>>(
+            query, cache, out, num_heads, seq_length);
+
+    // Let following pytorch ops handle synchronization
+    // cudaDeviceSynchronize();
+
+    // TODO: Wrap error checking in macro
+    if ((error = cudaGetLastError()) != cudaSuccess) {
+        printf("Error: %s (%s)\n",
+               cudaGetErrorName(error),
+               cudaGetErrorString(error));
+    }
+}

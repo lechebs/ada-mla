@@ -1,0 +1,95 @@
+#include <torch/python.h>
+
+#include "mla_decode.hpp"
+
+at::Tensor mla_decode_naive(const at::Tensor &query,
+                            const at::Tensor &cache)
+{
+    // TODO: Use TORCH_CHECK on sizes, dtype and device
+    const c10::IntArrayRef q_size = query.sizes();
+    const at::Device dev = query.device();
+    const at::ScalarType dtype = query.scalar_type();
+    // Set dtype and layout same as input tensors
+    at::TensorOptions options =
+        at::TensorOptions().device(dev).dtype(dtype);
+    at::Tensor out = at::empty(q_size, options);
+
+    float *o_ptr = static_cast<float *>(out.data_ptr());
+    // TODO: Perhaps call .contiguous() on the inputs
+    const float *q_ptr = static_cast<float *>(query.data_ptr());
+    const float *c_ptr = static_cast<float *>(cache.data_ptr());
+
+    // I need to obtain the pointer type based on at::ScalarType
+
+    // Materialize attn matrix
+    at::Tensor attn = at::empty({ q_size[0], cache.size(0) }, options);
+    float *a_ptr = static_cast<float *>(attn.data_ptr());
+
+    run_mla_decode_naive(
+        q_ptr, c_ptr, a_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
+
+    return out;
+}
+
+at::Tensor mla_decode_fused(const at::Tensor &query,
+                            const at::Tensor &cache)
+{
+    // todo: refactor common logic with mla_decode_naive
+
+    const c10::IntArrayRef q_size = query.sizes();
+    const at::Device dev = query.device();
+    at::TensorOptions options = at::TensorOptions().device(dev);
+    at::Tensor out = at::empty(q_size, options);
+
+    float *o_ptr = static_cast<float *>(out.data_ptr());
+    const float *q_ptr = static_cast<float *>(query.data_ptr());
+    const float *c_ptr = static_cast<float *>(cache.data_ptr());
+
+    run_mla_decode_fused(
+        q_ptr, c_ptr, o_ptr, q_size[0], q_size[1], cache.size(0));
+
+    return out;
+}
+
+at::Tensor mla_decode_splitkv(const at::Tensor &query,
+                              const at::Tensor &cache)
+{
+    // todo: refactor common logic with mla_decode_naive
+
+    const c10::IntArrayRef q_size = query.sizes();
+    const at::Device dev = query.device();
+    at::TensorOptions options = at::TensorOptions().device(dev);
+    at::Tensor out = at::empty(q_size, options);
+
+    float *o_ptr = static_cast<float *>(out.data_ptr());
+    const float *q_ptr = static_cast<float *>(query.data_ptr());
+    const float *c_ptr = static_cast<float *>(cache.data_ptr());
+
+    int num_splits = 4;
+    int num_heads = q_size[0];
+    int head_dim_c = q_size[1];
+    int seq_length = cache.size(0);
+
+    at::Tensor splits_max = at::empty({ num_splits, num_heads }, options);
+    at::Tensor splits_sum = at::empty({ num_splits, num_heads }, options);
+    // Each split needs its own output tensor (note that out could be reused)
+    at::Tensor splits_out = at::empty(
+        { num_splits, num_heads, head_dim_c }, options);
+
+    float *splits_max_ptr = splits_max.data_ptr<float>();
+    float *splits_sum_ptr = splits_sum.data_ptr<float>();
+    float *splits_out_ptr = splits_out.data_ptr<float>();
+
+    run_mla_decode_splitkv(
+        q_ptr, c_ptr, o_ptr, splits_max_ptr, splits_sum_ptr, splits_out_ptr,
+        num_splits, num_heads, head_dim_c, seq_length);
+
+    return out;
+}
+
+PYBIND11_MODULE(ada_mla, m)
+{
+    m.def("mla_decode_naive", &mla_decode_naive);
+    m.def("mla_decode_fused", &mla_decode_fused);
+    m.def("mla_decode_split", &mla_decode_splitkv);
+}

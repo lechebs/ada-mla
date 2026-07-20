@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_fp16.h>
+
 template<int block_size>
 __global__ void mla_decode_naive_softmax(float *A, int n)
 {
@@ -55,9 +57,9 @@ __global__ void mla_decode_naive_softmax(float *A, int n)
 }
 
 template<int Tm, int Tn, int Tk, bool transb> // Whether B is transposed
-__global__ void mla_decode_naive_gemm(const float *A,
-                                      const float *B,
-                                      float *O,
+__global__ void mla_decode_naive_gemm(const float *__restrict__ A,
+                                      const float *__restrict__ B,
+                                      float *__restrict__ O,
                                       int m,
                                       int n,
                                       int k,
@@ -78,12 +80,6 @@ __global__ void mla_decode_naive_gemm(const float *A,
 
         // Assumes tiles are of the same size of the block
         As[threadIdx.y * Tk + threadIdx.x] = A[y * k + kk + threadIdx.x];
-
-        /*
-        Bs[threadIdx.y * Tn + threadIdx.x] =
-            (transb ? B[x * k + kk + threadIdx.y] : // WARNING: Non coalesced
-                      B[(kk + threadIdx.y) * n + x]);
-        */
 
         if (transb) {
             // Transpose when storing in shmem
