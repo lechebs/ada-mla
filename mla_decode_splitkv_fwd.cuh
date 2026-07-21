@@ -1,20 +1,34 @@
 #pragma once
 
-template<int QTileM, int QTileK, int CTileN, int HeadDim>
-__global__ void mla_decode_split_kv(const float *__restrict__ Q,
-                                    const float *__restrict__ C,
-                                    float *__restrict__ O,
-                                    float *__restrict__ max,
-                                    float *__restrict__ sum,
-                                    int M, // num_heads
-                                    int N, // seq_length
-                                    int num_splits)
-{
-    extern __shared__ float shmem[];
+// TODO: Find a way to get around this
 
-    float *Qs = shmem;
-    float *Cs = Qs + QTileM * HeadDim;
-    float *Ps = Cs + HeadDim * CTileN;
+#ifdef __CUDA_NO_HALF_OPERATORS__
+#undef __CUDA_NO_HALF_OPERATORS__
+#endif
+
+#ifdef __CUDA_NO_HALF_CONVERSIONS__
+#undef __CUDA_NO_HALF_CONVERSIONS__
+#endif
+
+#include <cuda_fp16.h>
+
+template<int QTileM, int QTileK, int CTileN, int HeadDim, typename Scalar>
+__global__ void mla_decode_splitkv(const Scalar *__restrict__ Q,
+                                   const Scalar *__restrict__ C,
+                                   Scalar *__restrict__ O,
+                                   Scalar *__restrict__ max,
+                                   Scalar *__restrict__ sum,
+                                   int M, // num_heads
+                                   int N, // seq_length
+                                   int num_splits)
+{
+    // TODO: Probably better to specialize struct that returns
+    // a pointer to extern __shared__
+    extern __shared__ __align__(sizeof(Scalar)) unsigned char shmem[];
+
+    Scalar *Qs = reinterpret_cast<Scalar *>(shmem);
+    Scalar *Cs = Qs + QTileM * HeadDim;
+    Scalar *Ps = Cs + HeadDim * CTileN;
 
     // WARNING: out is initialized with at::empty,
     // while here I'm supposing is initialized with at::zeros
@@ -27,8 +41,8 @@ __global__ void mla_decode_split_kv(const float *__restrict__ Q,
 
     __syncthreads();
 
-    float prev_max = 0.0f; // max logit of prev tile
-    float prev_sum = 0.0f; // denominator of prev tile
+    Scalar prev_max = 0.0f; // max logit of prev tile
+    Scalar prev_sum = 0.0f; // denominator of prev tile
 
     int split_N = N / num_splits;
     // Tiled loop over attn matrix cols
@@ -50,7 +64,7 @@ __global__ void mla_decode_split_kv(const float *__restrict__ Q,
 
         __syncthreads();
 
-        float log = 0.0f; // Logit
+        Scalar log = 0.0f; // Logit
         // Tiled loop over query cols
         // TODO: At this point QTileK is not used, but it will
         // be used to better parallelize across warps
@@ -67,22 +81,24 @@ __global__ void mla_decode_split_kv(const float *__restrict__ Q,
 
         // As long as CTileN <= 32, use warp shuffles to compute partial reduction
 
-        float max = log;
+        Scalar max = log;
         // Butterfly reduction within quarter warp
+        #pragma unroll
         for (int s = CTileN >> 1; s > 0; s >>= 1) {
             max = fmaxf(max, __shfl_xor_sync(0xffffffff, max, s));
         }
 
         max = fmaxf(prev_max, max);
 
-        float exp_log = expf(log - max);
-        float sum = exp_log;
+        Scalar exp_log = expf(log - max);
+        Scalar sum = exp_log;
+        #pragma unroll
         for (int s = CTileN >> 1; s > 0; s >>= 1) {
             sum += __shfl_xor_sync(0xffffffff, sum, s);
         }
 
         // Online softmax correction
-        float norm_coef = expf(prev_max - max);
+        Scalar norm_coef = expf(prev_max - max);
         sum += prev_sum * norm_coef;
 
         prev_max = max;
@@ -135,4 +151,54 @@ __global__ void mla_decode_split_kv(const float *__restrict__ Q,
 __global__ void mla_decode_combine()
 {
 
+}
+
+template<typename T>
+void run_mla_decode_splitkv_(const T *query,
+                             const T *cache,
+                             T *out,
+                             T *splits_max,
+                             T *splits_sum,
+                             T *splits_out,
+                             int num_splits,
+                             int num_heads,
+                             int head_dim_c,
+                             int seq_length)
+{
+    const int q_tile_m = 8;
+    const int q_tile_k = 16;
+    const int c_tile_n = 32;
+
+    dim3 block(c_tile_n, q_tile_m);
+    dim3 grid(num_splits, (num_heads - 1) / block.y + 1);
+
+    // TODO: Compute size using input args
+    int shmem_bytes = (q_tile_m * head_dim_c +
+                       c_tile_n * head_dim_c +
+                       q_tile_m * c_tile_n) * sizeof(T);
+
+    // Dynamic shmem is required for allocations > 48KB
+    cudaError_t error = cudaFuncSetAttribute(
+        mla_decode_splitkv<q_tile_m, q_tile_k, c_tile_n, 576, T>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_bytes);
+
+    if (error != cudaSuccess) {
+        printf("Error: %s (%s)\n",
+               cudaGetErrorName(error),
+               cudaGetErrorString(error));
+    }
+
+    mla_decode_splitkv<q_tile_m, q_tile_k, c_tile_n, 576, T>
+        <<<grid, block, shmem_bytes>>>(
+            query, cache, splits_out, splits_max, splits_sum,
+            num_heads, seq_length, num_splits);
+
+    //mla_decode_combine<>
+
+    if ((error = cudaGetLastError()) != cudaSuccess) {
+        printf("Error: %s (%s)\n",
+               cudaGetErrorName(error),
+               cudaGetErrorString(error));
+    }
 }

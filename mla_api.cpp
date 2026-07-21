@@ -51,23 +51,19 @@ at::Tensor mla_decode_fused(const at::Tensor &query,
     return out;
 }
 
-at::Tensor mla_decode_splitkv(const at::Tensor &query,
-                              const at::Tensor &cache)
+template<typename Scalar>
+void mla_decode_splitkv_(const at::Tensor &query,
+                         const at::Tensor &cache,
+                         at::Tensor &out,
+                         at::TensorOptions options,
+                         int num_splits)
 {
-    // todo: refactor common logic with mla_decode_naive
+    Scalar *o_ptr = out.data_ptr<Scalar>();
+    const Scalar *q_ptr = query.data_ptr<Scalar>();
+    const Scalar *c_ptr = cache.data_ptr<Scalar>();
 
-    const c10::IntArrayRef q_size = query.sizes();
-    const at::Device dev = query.device();
-    at::TensorOptions options = at::TensorOptions().device(dev);
-    at::Tensor out = at::empty(q_size, options);
-
-    float *o_ptr = static_cast<float *>(out.data_ptr());
-    const float *q_ptr = static_cast<float *>(query.data_ptr());
-    const float *c_ptr = static_cast<float *>(cache.data_ptr());
-
-    int num_splits = 4;
-    int num_heads = q_size[0];
-    int head_dim_c = q_size[1];
+    int num_heads = query.size(0);
+    int head_dim_c = query.size(1);
     int seq_length = cache.size(0);
 
     at::Tensor splits_max = at::empty({ num_splits, num_heads }, options);
@@ -76,13 +72,38 @@ at::Tensor mla_decode_splitkv(const at::Tensor &query,
     at::Tensor splits_out = at::empty(
         { num_splits, num_heads, head_dim_c }, options);
 
-    float *splits_max_ptr = splits_max.data_ptr<float>();
-    float *splits_sum_ptr = splits_sum.data_ptr<float>();
-    float *splits_out_ptr = splits_out.data_ptr<float>();
+    Scalar *splits_max_ptr = splits_max.data_ptr<Scalar>();
+    Scalar *splits_sum_ptr = splits_sum.data_ptr<Scalar>();
+    Scalar *splits_out_ptr = splits_out.data_ptr<Scalar>();
 
-    run_mla_decode_splitkv(
+    run_mla_decode_splitkv<Scalar>(
         q_ptr, c_ptr, o_ptr, splits_max_ptr, splits_sum_ptr, splits_out_ptr,
         num_splits, num_heads, head_dim_c, seq_length);
+}
+
+at::Tensor mla_decode_splitkv(const at::Tensor &query,
+                              const at::Tensor &cache)
+{
+    // todo: refactor common logic with mla_decode_naive
+
+    at::TensorOptions options =
+        at::TensorOptions().device(query.device()).dtype(query.scalar_type());
+    at::Tensor out = at::empty(query.sizes(), options);
+
+    const int num_splits = 1;
+
+    // dispatch based on dtype
+    switch (query.scalar_type()) {
+        case at::kFloat:
+            mla_decode_splitkv_<float>(query, cache, out, options, num_splits);
+            break;
+        case at::kHalf:
+            mla_decode_splitkv_<at::Half>(
+                query, cache, out, options, num_splits);
+            break;
+        default:
+            break;
+    }
 
     return out;
 }

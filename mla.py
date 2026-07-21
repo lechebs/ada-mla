@@ -54,10 +54,14 @@ def run_test(mla_funcs: list[callable],
              num_heads: int,
              seq_length: int,
              head_dim: int=HEAD_DIM_C,
+             dtype: torch.dtype=torch.float32,
              ref_func: callable=mla_decode_torch):
 
-    q = torch.normal(0, 1, size=(num_heads, head_dim)).to(DEVICE)
-    c = torch.normal(0, 1, size=(seq_length, head_dim)).to(DEVICE)
+    q = torch.normal(0, 1, size=(num_heads, head_dim),
+                     device=DEVICE, dtype=dtype)
+    c = torch.normal(0, 1, size=(seq_length, head_dim),
+                     device=DEVICE, dtype=dtype)
+
     out_ref = ref_func(q, c)
 
     for func in mla_funcs:
@@ -71,14 +75,17 @@ def run_benchmark(mla_funcs: list[callable],
                   num_heads: int,
                   seq_lengths: list[int],
                   head_dim: int=HEAD_DIM_C,
+                  dtype: torch.dtype=torch.float32,
                   num_iters: int=100):
 
-    q = torch.normal(0, 1, size=(num_heads, head_dim)).to(DEVICE)
+    q = torch.normal(
+        0, 1, size=(num_heads, head_dim), device=DEVICE, dtype=dtype)
 
     results = []
 
     for seq_len in seq_lengths:
-        c = torch.normal(0, 1, size=(seq_len, head_dim)).to(DEVICE)
+        c = torch.normal(
+            0, 1, size=(seq_len, head_dim), device=DEVICE, dtype=dtype)
 
         for func in mla_funcs:
             t = Timer(
@@ -105,10 +112,12 @@ if __name__ == "__main__":
         mla_decode_split
     ]
 
-    run_test(mla_decode_funcs[1:],
+    run_test([mla_decode_split],
              num_heads=128,
-             seq_length=4096)
+             seq_length=4096,
+             dtype=torch.float32)
 
-    run_benchmark(mla_decode_funcs,
+    run_benchmark([mla_decode_split],
                   num_heads=128,
-                  seq_lengths=[512, 1024, 4096, 8192])
+                  seq_lengths=[512, 1024, 4096, 8192],
+                  dtype=torch.float32)
