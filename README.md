@@ -41,9 +41,9 @@ Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread
 
 |kernel|time (ms)|
 |:-----|--------:|
-|pytorch eager                                      |0.357|
+|pytorch eager                                      |0.315|
 ||
-|naive (non fused gemm [`QM=QK=CN=16`] + softmax)   | 1.91|
+|naive (non fused gemm [`QM=QK=CN=16`] + softmax)   | 1.61|
 ||
 |fused (fully tiled)  [`QM=QK=CN=16`]               |  ~30|
 | + (no C vertical tiling) [`QM=32 QK=16 CN=8`]     |19.29|
@@ -51,6 +51,7 @@ Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread
 | + [`QM=QK=CN=16`]                                 | 7.21|
 | + [`QM=8 QK=16 CN=32`]                            | 3.72|
 | + allow unrolling Q and C gmem->shmem loops       | 2.64|
+| + slice-k QC^T product with vertical coarsening   | 1.18|
 ||
 |split-kv|
 

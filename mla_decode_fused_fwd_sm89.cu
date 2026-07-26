@@ -19,9 +19,11 @@ void run_mla_decode_fused(const float *query,
     dim3 block(c_tile_n, q_tile_m);
     dim3 grid(1, (num_heads - 1) / block.y + 1);
 
+    int num_warps = (block.x * block.y) / 32;
+
     int shmem_bytes = (q_tile_m * head_dim_c +
                        c_tile_n * head_dim_c +
-                       q_tile_m * c_tile_n) * 4;
+                       q_tile_m * c_tile_n * num_warps) * 4;
 
     // Dynamic shmem is required for allocations > 48KB
     cudaError_t error = cudaFuncSetAttribute(

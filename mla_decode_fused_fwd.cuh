@@ -15,6 +15,11 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     float *Cs = Qs + QTileM * HeadDim;
     float *Ps = Cs + HeadDim * CTileN;
 
+    const int num_warps = QTileM * CTileN / 32;
+    const int warp_id = threadIdx.y;
+
+    // Ps has shape (num_warps, QTileM, CTileN)
+
     /*
     for (int j = threadIdx.y * blockDim.x + threadIdx.x;
              j < QTileM * HeadDim;
@@ -40,7 +45,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     // Tiled loop over attn matrix cols
     for (int C_j = 0; C_j < N; C_j += CTileN) {
 
-        // Load Cs once, reuse it for the projection
+       // Load Cs once, reuse it for the projection
        // Should I worry about transposing Cs? I guess not
 
         // Unrolling here increases performance,
@@ -49,22 +54,46 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         for (int j = threadIdx.y * blockDim.x + threadIdx.x;
                  j < CTileN * HeadDim;
                  j += QTileM * CTileN) {
+            // TODO: Load chunks while performing products to pipeline?
             Cs[j] = C[C_j * HeadDim + j];
         }
 
         __syncthreads();
 
-        float log = 0.0f; // Logit
-        // Tiled loop over query cols
-        // TODO: At this point QTileK is not used, but it will
-        // be used to better parallelize across warps
-        for (int Q_j = 0; Q_j < HeadDim; Q_j += QTileK) {
+        float logs[QTileM] = { 0 };
+
+        // Each warp accumulates a partial product (slice-k),
+        // while each thread computes a column of QTileM values
+        // by accumulating outer products
+        for (int Q_j = QTileK * warp_id;
+                 Q_j < HeadDim; Q_j += QTileK * num_warps) {
 
             for (int k = 0; k < QTileK; ++k) {
-                log += Qs[threadIdx.y * HeadDim + Q_j + k] *
-                       // Cs is transposed
-                       Cs[threadIdx.x * HeadDim + Q_j + k];
+                // Tile row into registers
+                // TODO: Avoid bank conflicts
+                float C_val = Cs[threadIdx.x * HeadDim + Q_j + k];
+
+                // Unroll so that logs gets promoted to registers
+                #pragma unroll
+                for (int m = 0; m < QTileM; ++m) {
+                    // TODO: Avoid bank conflicts
+                    logs[m] += C_val * Qs[m * HeadDim + Q_j + k];
+                }
             }
+        }
+
+        #pragma unroll
+        for (int m = 0; m < QTileM; ++m) {
+            Ps[QTileM * CTileN * warp_id + m * CTileN + threadIdx.x] = logs[m];
+        }
+
+        __syncthreads();
+
+        // Reduce logs across warps, one element per thread
+        // TODO: Tree reduction?
+        float log = 0;
+        for (int w = 0; w < num_warps; ++w) {
+            log += Ps[QTileM * CTileN * w + threadIdx.y * CTileN + threadIdx.x];
         }
 
         log /= sqrtf(HeadDim);
