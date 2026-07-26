@@ -13,6 +13,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
     float *Qs = shmem;
     float *Cs = Qs + QTileM * HeadDim;
+    // TODO: Qs could be reused to hold Ps values
     float *Ps = Cs + HeadDim * CTileN;
 
     const int num_warps = QTileM * CTileN / 32;
@@ -45,17 +46,19 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     // Tiled loop over attn matrix cols
     for (int C_j = 0; C_j < N; C_j += CTileN) {
 
-       // Load Cs once, reuse it for the projection
-       // Should I worry about transposing Cs? I guess not
+        // Load Cs once, reuse it for the projection
+        // Should I worry about transposing Cs? I guess not
 
-        // Unrolling here increases performance,
-        // compiler does it automatically
-        // #pragma unroll 8
+        #pragma unroll 4
         for (int j = threadIdx.y * blockDim.x + threadIdx.x;
-                 j < CTileN * HeadDim;
+                 j < CTileN * HeadDim / 4;
                  j += QTileM * CTileN) {
-            // TODO: Load chunks while performing products to pipeline?
-            Cs[j] = C[C_j * HeadDim + j];
+            // TODO: Load chunks asynchronously while
+            // performing products to pipeline?
+            // Warp-specialization for consumer-producer pattern?
+            // I can afford blocks with more threads..
+            reinterpret_cast<float4 *>(Cs)[j] =
+                reinterpret_cast<const float4 *>(C)[C_j * HeadDim / 4 + j];
         }
 
         __syncthreads();
@@ -84,7 +87,9 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
         #pragma unroll
         for (int m = 0; m < QTileM; ++m) {
-            Ps[QTileM * CTileN * warp_id + m * CTileN + threadIdx.x] = logs[m];
+            // TODO: Qs could be reused to perform reduction
+            Ps[QTileM * CTileN * warp_id + m * CTileN + threadIdx.x] =
+                logs[m];
         }
 
         __syncthreads();
@@ -121,24 +126,44 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         prev_max = max;
         prev_sum = sum;
 
+        __shared__ float norm_coefs[QTileM];
+        // Can I avoid this? I guess not
+        if (threadIdx.x / warpSize == 0) {
+            norm_coefs[warp_id] = norm_coef;
+        }
+
         // Load exp logit to shmem
         Ps[threadIdx.y * blockDim.x + threadIdx.x] = exp_log;
 
         __syncthreads();
 
-        for (int j = 0; j < HeadDim; j += CTileN) {
+        for (int j = warp_id * CTileN; j < HeadDim; j += CTileN * num_warps) {
+
+            // Each thread computes a column of results
+            float col[QTileM];
 
             // Online softmax correction
-            O[(blockIdx.y * QTileM + threadIdx.y) * HeadDim +
-                j + threadIdx.x] *= norm_coef;
-            //Os[O_i * HeadDim + j + O_j] *= norm_coef;
+            #pragma unroll
+            for (int m = 0; m < QTileM; ++m) {
+                col[m] = O[(blockIdx.y * QTileM + m) * HeadDim
+                    + j + threadIdx.x] * norm_coefs[m];
+            }
 
+            // TODO: Try letting each warp compute multiple tiles
+            // so that Qs values can be reused!
             for (int k = 0; k < CTileN; ++k) {
-                O[(blockIdx.y * QTileM + threadIdx.y) * HeadDim +
-                    j + threadIdx.x] +=
-                //Os[O_i * HeadDim + j + O_j] +=
-                    Ps[threadIdx.y * CTileN + k] *
-                    Cs[k * HeadDim + j + threadIdx.x];
+                float C_val = Cs[k * HeadDim + j + threadIdx.x];
+
+                #pragma unroll
+                for (int m = 0; m < QTileM; ++m) {
+                    col[m] += Ps[m * CTileN + k] * C_val;
+                }
+            }
+
+            #pragma unroll
+            for (int m = 0; m < QTileM; ++m) {
+                O[(blockIdx.y * QTileM + m) * HeadDim + j + threadIdx.x] =
+                    col[m];
             }
         }
 
@@ -148,7 +173,5 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     for (int j = 0; j < HeadDim; j += CTileN) {
         O[(blockIdx.y * QTileM + threadIdx.y) * HeadDim +
             j + threadIdx.x] /= prev_sum;
-        //O[(blockIdx.y * QTileM + O_i) * HeadDim + j + O_j] =
-        //    Os[O_i * HeadDim + j + O_j] / prev_sum;
     }
 }
