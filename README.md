@@ -54,6 +54,7 @@ Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread
 | + slice-k QC^T product with vertical coarsening      | 1.18|
 | + warp-parallel PC product with vertical coarsening  | 1.02|
 | + vectorized C load with unroll 4                    |0.964|
+| + padding Cs to avoid bank conflicts                 |0.751|
 ||
 |split-kv|
 
@@ -62,6 +63,9 @@ Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread
 - I think I've to quickly move to fp16, otherwise shmem isn't enough!
 - When the number of threads in the block is fixed to `256`, increasing CTileN while reducing QTileM is better (at least without split-kv), I guess because it exposes more block parallelism and reduces the number of iterations along C. It could also be due to less shmem bank conflicts. I initially chose a taller Q block since it could be better in terms of AI (right?).
 - Vectorizing gmem->shmem loads doesn't seem to impact performance, at least when the compiler can unroll their loops.
+
+- It looks like vectorized shmem loads (LDS.128) broadcast require two wavefronts (and not 4?), that's why
+they appear like they are producing bank conflicts.
 
 ## Roadmap
 

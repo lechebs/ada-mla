@@ -22,7 +22,9 @@ void run_mla_decode_fused(const float *query,
     int num_warps = (block.x * block.y) / 32;
 
     int shmem_bytes = (q_tile_m * head_dim_c +
-                       c_tile_n * head_dim_c +
+                       // +4 padding to avoid bank conflicts
+                       // and guarantee float4 alignment (for vector loads)
+                       c_tile_n * (head_dim_c + 4) +
                        q_tile_m * c_tile_n * num_warps) * 4;
 
     // Dynamic shmem is required for allocations > 48KB

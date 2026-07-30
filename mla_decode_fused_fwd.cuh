@@ -13,8 +13,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
     float *Qs = shmem;
     float *Cs = Qs + QTileM * HeadDim;
-    // TODO: Qs could be reused to hold Ps values
-    float *Ps = Cs + HeadDim * CTileN;
+    float *Ps = Cs + (HeadDim + 4) * CTileN;
 
     const int num_warps = QTileM * CTileN / 32;
     const int warp_id = threadIdx.y;
@@ -33,8 +32,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     // while here I'm supposing is initialized with at::zeros
 
     for (int i = blockDim.x * threadIdx.y + threadIdx.x;
-             i < QTileM * HeadDim;
-             i += QTileM * CTileN) {
+             i < QTileM * HeadDim; i += QTileM * CTileN) {
         Qs[i] = Q[(QTileM * blockIdx.y) * HeadDim + i];
     }
 
@@ -47,23 +45,23 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     for (int C_j = 0; C_j < N; C_j += CTileN) {
 
         // Load Cs once, reuse it for the projection
-        // Should I worry about transposing Cs? I guess not
+        // Should I worry about transposing Cs?
 
         #pragma unroll 4
         for (int j = threadIdx.y * blockDim.x + threadIdx.x;
-                 j < CTileN * HeadDim / 4;
+                 j < (CTileN * HeadDim >> 2);
                  j += QTileM * CTileN) {
             // TODO: Load chunks asynchronously while
             // performing products to pipeline?
             // Warp-specialization for consumer-producer pattern?
             // I can afford blocks with more threads..
-            reinterpret_cast<float4 *>(Cs)[j] =
-                reinterpret_cast<const float4 *>(C)[C_j * HeadDim / 4 + j];
+            reinterpret_cast<float4 *>(Cs)[j + j / (HeadDim >> 2)] =
+                reinterpret_cast<const float4 *>(C)[(C_j * HeadDim >> 2) + j];
         }
 
         __syncthreads();
 
-        float logs[QTileM] = { 0 };
+        float logs[QTileM] = { 0 }; // logits
 
         // Each warp accumulates a partial product (slice-k),
         // while each thread computes a column of QTileM values
@@ -74,7 +72,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             for (int k = 0; k < QTileK; ++k) {
                 // Tile row into registers
                 // TODO: Avoid bank conflicts
-                float C_val = Cs[threadIdx.x * HeadDim + Q_j + k];
+                float C_val = Cs[threadIdx.x * (HeadDim + 4) + Q_j + k];
 
                 // Unroll so that logs gets promoted to registers
                 #pragma unroll
@@ -152,7 +150,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             // TODO: Try letting each warp compute multiple tiles
             // so that Qs values can be reused!
             for (int k = 0; k < CTileN; ++k) {
-                float C_val = Cs[k * HeadDim + j + threadIdx.x];
+                float C_val = Cs[k * (HeadDim + 4) + j + threadIdx.x];
 
                 #pragma unroll
                 for (int m = 0; m < QTileM; ++m) {
