@@ -39,7 +39,8 @@ at::Tensor mla_decode_fused(const at::Tensor &query,
     const c10::IntArrayRef q_size = query.sizes();
     const at::Device dev = query.device();
     at::TensorOptions options = at::TensorOptions().device(dev);
-    at::Tensor out = at::empty(q_size, options);
+    // TODO: Fill with zeros inside the kernel
+    at::Tensor out = at::zeros(q_size, options);
 
     float *o_ptr = static_cast<float *>(out.data_ptr());
     const float *q_ptr = static_cast<float *>(query.data_ptr());
@@ -88,7 +89,7 @@ at::Tensor mla_decode_splitkv(const at::Tensor &query,
 
     at::TensorOptions options =
         at::TensorOptions().device(query.device()).dtype(query.scalar_type());
-    at::Tensor out = at::empty(query.sizes(), options);
+    at::Tensor out = at::zeros(query.sizes(), options);
 
     const int num_splits = 1;
 

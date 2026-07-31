@@ -55,9 +55,16 @@ Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread
 | + warp-parallel PC product with vertical coarsening  | 1.02|
 | + vectorized C load with unroll 4                    |0.964|
 | + padding Cs to avoid bank conflicts                 |0.751|
-||
-|split-kv|
 
+Moving to ncu execution time (more precises, flushes caches at each iteration).
+|kernel|time (ms)| peak flops (fp32) |
+|:-----|---:|---:|
+|pytorch eager                                         |0.434|48%|
+||
+| (fused) vectorized C load with unroll 4              |1.190|13%|
+| + padding Cs to avoid bank conflicts                 |0.934|16%|
+| + 2-stage pipeline to load C                         |0.795|19%|
+| + 3-stage pipeline to load C                         |0.769|20%|
 
 - Using shmem to accumulate output results degrades performance apparently.
 - I think I've to quickly move to fp16, otherwise shmem isn't enough!

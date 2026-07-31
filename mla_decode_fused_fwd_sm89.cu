@@ -16,10 +16,12 @@ void run_mla_decode_fused(const float *query,
     const int q_tile_k = 16;
     const int c_tile_n = 32;
 
+    const int num_stages = 3;
+
     dim3 block(c_tile_n, q_tile_m);
     dim3 grid(1, (num_heads - 1) / block.y + 1);
 
-    int num_warps = (block.x * block.y) / 32;
+    int num_warps = (block.x * block.y) / WARP_SIZE;
 
     int shmem_bytes = (q_tile_m * head_dim_c +
                        // +4 padding to avoid bank conflicts
@@ -29,7 +31,7 @@ void run_mla_decode_fused(const float *query,
 
     // Dynamic shmem is required for allocations > 48KB
     cudaError_t error = cudaFuncSetAttribute(
-        mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576>,
+        mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576, num_stages>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_bytes);
 
@@ -39,12 +41,9 @@ void run_mla_decode_fused(const float *query,
                cudaGetErrorString(error));
     }
 
-    mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576>
+    mla_decode_fused<q_tile_m, q_tile_k, c_tile_n, 576, num_stages>
         <<<grid, block, shmem_bytes>>>(
             query, cache, out, num_heads, seq_length);
-
-    // Let following pytorch ops handle synchronization
-    // cudaDeviceSynchronize();
 
     // TODO: Wrap error checking in macro
     if ((error = cudaGetLastError()) != cudaSuccess) {

@@ -1,8 +1,29 @@
 #pragma once
 
+#include <cuda_pipeline.h>
+
+#define WARP_SIZE 32
+
+template<int QTileK, int CTileN, int HeadDim>
+__device__ __forceinline__ void pipeline_prefetch_kv_tile(
+    const float *__restrict__ gmem_src,
+    float *__restrict__ shmem_dst)
+{
+    #pragma unroll
+    for (int j = threadIdx.x; j < QTileK * CTileN / 4; j += WARP_SIZE) {
+        // Coordinates within the tile
+        const int tile_i = j / (QTileK / 4);
+        const int tile_j = j % (QTileK / 4);
+        __pipeline_memcpy_async(
+            shmem_dst + tile_i * (HeadDim + 4) + 4 * tile_j,
+            gmem_src + tile_i * HeadDim + 4 * tile_j,
+            sizeof(float4));
+    }
+}
+
 // Template args not strictly needed anymore since shmem is dynamic
 // but they're probably going to be useful to unroll some loops
-template<int QTileM, int QTileK, int CTileN, int HeadDim>
+template<int QTileM, int QTileK, int CTileN, int HeadDim, int NumStages = 3>
 __global__ void mla_decode_fused(const float *__restrict__ Q,
                                  const float *__restrict__ C,
                                  float *__restrict__ O,
@@ -15,18 +36,10 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     float *Cs = Qs + QTileM * HeadDim;
     float *Ps = Cs + (HeadDim + 4) * CTileN;
 
-    const int num_warps = QTileM * CTileN / 32;
+    const int num_warps = QTileM * CTileN / WARP_SIZE;
     const int warp_id = threadIdx.y;
 
     // Ps has shape (num_warps, QTileM, CTileN)
-
-    /*
-    for (int j = threadIdx.y * blockDim.x + threadIdx.x;
-             j < QTileM * HeadDim;
-             j += blockDim.x * blockDim.y) {
-        Os[j] = 0.0f;
-    }
-    */
 
     // WARNING: out is initialized with at::empty,
     // while here I'm supposing is initialized with at::zeros
@@ -47,31 +60,44 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         // Load Cs once, reuse it for the projection
         // Should I worry about transposing Cs?
 
-        #pragma unroll 4
-        for (int j = threadIdx.y * blockDim.x + threadIdx.x;
-                 j < (CTileN * HeadDim >> 2);
-                 j += QTileM * CTileN) {
-            // TODO: Load chunks asynchronously while
-            // performing products to pipeline?
-            // Warp-specialization for consumer-producer pattern?
-            // I can afford blocks with more threads..
-            reinterpret_cast<float4 *>(Cs)[j + j / (HeadDim >> 2)] =
-                reinterpret_cast<const float4 *>(C)[(C_j * HeadDim >> 2) + j];
-        }
+        // Each warp prefetches a (CTileN, QTileK) tile from C
+        // for each stage of the pipeline
+        const int stage_width = QTileK * num_warps;
+        const int warp_c_offset = QTileK * warp_id;
 
-        __syncthreads();
+        #pragma unroll
+        for (int s = 0; s < NumStages - 1; ++s) {
+            // Note that before wrapping the prefetch in a function,
+            // the kernel was slightly faster and used more registers
+            pipeline_prefetch_kv_tile<QTileK, CTileN, HeadDim>(
+                C + C_j * HeadDim + warp_c_offset + s * stage_width,
+                Cs + warp_c_offset + s * stage_width);
+            __pipeline_commit();
+        }
 
         float logs[QTileM] = { 0 }; // logits
 
         // Each warp accumulates a partial product (slice-k),
         // while each thread computes a column of QTileM values
         // by accumulating outer products
-        for (int Q_j = QTileK * warp_id;
+        for (int Q_j = warp_c_offset;
                  Q_j < HeadDim; Q_j += QTileK * num_warps) {
+
+            // Prefetching the next tiles
+            if (Q_j < HeadDim - (NumStages - 1) * stage_width) {
+                // TODO: Warp-specialization for consumer-producer pattern?
+                pipeline_prefetch_kv_tile<QTileK, CTileN, HeadDim>(
+                    C + C_j * HeadDim + Q_j + (NumStages - 1) * stage_width,
+                    Cs + Q_j + (NumStages - 1) * stage_width);
+            }
+            // Commit even when pipeline is empty for better codegen
+            __pipeline_commit();
+
+            __pipeline_wait_prior(NumStages - 1);
+            __syncwarp();
 
             for (int k = 0; k < QTileK; ++k) {
                 // Tile row into registers
-                // TODO: Avoid bank conflicts
                 float C_val = Cs[threadIdx.x * (HeadDim + 4) + Q_j + k];
 
                 // Unroll so that logs gets promoted to registers
@@ -81,11 +107,11 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
                     logs[m] += C_val * Qs[m * HeadDim + Q_j + k];
                 }
             }
+
         }
 
         #pragma unroll
         for (int m = 0; m < QTileM; ++m) {
-            // TODO: Qs could be reused to perform reduction
             Ps[QTileM * CTileN * warp_id + m * CTileN + threadIdx.x] =
                 logs[m];
         }
