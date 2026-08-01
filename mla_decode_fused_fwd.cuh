@@ -34,15 +34,13 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
     float *Qs = shmem;
     float *Cs = Qs + QTileM * HeadDim;
+    // TODO: Padding Cs causes excessive shared accesses
     float *Ps = Cs + (HeadDim + 4) * CTileN;
 
     const int num_warps = QTileM * CTileN / WARP_SIZE;
     const int warp_id = threadIdx.y;
 
     // Ps has shape (num_warps, QTileM, CTileN)
-
-    // WARNING: out is initialized with at::empty,
-    // while here I'm supposing is initialized with at::zeros
 
     for (int i = blockDim.x * threadIdx.y + threadIdx.x;
              i < QTileM * HeadDim; i += QTileM * CTileN) {
@@ -130,7 +128,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         // As long as CTileN <= 32, use warp shuffles to compute partial reduction
 
         float max = log;
-        // Butterfly reduction within quarter warp
+        // Butterfly warp reduction
         for (int s = CTileN >> 1; s > 0; s >>= 1) {
             max = fmaxf(max, __shfl_xor_sync(0xffffffff, max, s));
         }
@@ -161,33 +159,48 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
         __syncthreads();
 
-        for (int j = warp_id * CTileN; j < HeadDim; j += CTileN * num_warps) {
+        for (int j = 2 * warp_id * CTileN;
+                 j < HeadDim; j += 2 * CTileN * num_warps) {
 
-            // Each thread computes a column of results
-            float col[QTileM];
+            // Each thread computes two adjacent
+            // columns of the resulting tile
+            float col_1[QTileM];
+            float col_2[QTileM];
 
             // Online softmax correction
             #pragma unroll
             for (int m = 0; m < QTileM; ++m) {
-                col[m] = O[(blockIdx.y * QTileM + m) * HeadDim
-                    + j + threadIdx.x] * norm_coefs[m];
+                float norm_coef = norm_coefs[m];
+                // Force 8 byte loads to allow coalescing
+                float2 O_curr = reinterpret_cast<float2 *>(O)[
+                    (blockIdx.y * QTileM + m) * HeadDim / 2
+                        + j / 2 + threadIdx.x];
+
+                col_1[m] = O_curr.x * norm_coef;
+                col_2[m] = O_curr.y * norm_coef;
             }
 
             // TODO: Try letting each warp compute multiple tiles
             // so that Qs values can be reused!
             for (int k = 0; k < CTileN; ++k) {
-                float C_val = Cs[k * (HeadDim + 4) + j + threadIdx.x];
+                // Compiler does this already automatically here..
+                float2 C_val = reinterpret_cast<float2 *>(Cs)[
+                    k * (HeadDim + 4) / 2 + j / 2 + threadIdx.x];
 
                 #pragma unroll
                 for (int m = 0; m < QTileM; ++m) {
-                    col[m] += Ps[m * CTileN + k] * C_val;
+                    float P_val = Ps[m * CTileN + k];
+                    col_1[m] += P_val * C_val.x;
+                    col_2[m] += P_val * C_val.y;
                 }
             }
 
             #pragma unroll
             for (int m = 0; m < QTileM; ++m) {
-                O[(blockIdx.y * QTileM + m) * HeadDim + j + threadIdx.x] =
-                    col[m];
+                float2 O_new = { col_1[m], col_2[m] };
+                reinterpret_cast<float2 *>(O)[
+                    (blockIdx.y * QTileM + m) * HeadDim / 2
+                        + j / 2 + threadIdx.x] = O_new;
             }
         }
 

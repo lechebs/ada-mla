@@ -65,6 +65,7 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 | + padding Cs to avoid bank conflicts                 |0.934|16%|
 | + 2-stage pipeline to load C                         |0.795|19%|
 | + 3-stage pipeline to load C                         |0.769|20%|
+| + two cols horizontal coarsening for PC product      |0.664|22%|
 
 - Using shmem to accumulate output results degrades performance apparently.
 - I think I've to quickly move to fp16, otherwise shmem isn't enough!
@@ -73,6 +74,14 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 
 - It looks like vectorized shmem loads (LDS.128) broadcast require two wavefronts (and not 4?), that's why
 they appear like they are producing bank conflicts.
+
+## TODO
+
+- Slice-k with more than 8 warps.
+- 2D coarsening -> increase QTileM
+- Move to fp16 to reduce shmem requirements and fit two blocks in each SM.
+- Split-k.
+- Try to pipeline shmem->reg loads.
 
 ## Roadmap
 
