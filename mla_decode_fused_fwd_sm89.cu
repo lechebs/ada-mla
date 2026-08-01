@@ -13,7 +13,7 @@ void run_mla_decode_fused(const float *query,
     // TODO: Should I make head_dim_c known at compile time?
 
     const int q_tile_m = 8;
-    const int q_tile_k = 16;
+    const int q_tile_k = 8;
     const int c_tile_n = 32;
 
     const int num_stages = 3;
