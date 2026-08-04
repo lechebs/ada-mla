@@ -18,10 +18,6 @@ __device__ __forceinline__ void pipeline_prefetch_kv_tile(
         // Coordinates within the tile
         const int tile_i = j / (QTileK / 4);
         const int tile_j = j % (QTileK / 4);
-        // TODO: Why does this generates excessive gmem requests
-        // while it doesn't when using normal vector loads? Perhaps
-        // this is due to src not being 128 byte aligned
-        // (as the LDGSTS docs suggest)?
 
         const float *src = gmem_src + tile_i * HeadDim + 4 * tile_j;
         // Convert generic pointer to shared space state
@@ -42,6 +38,9 @@ __device__ __forceinline__ void pipeline_prefetch_kv_tile(
     }
 }
 
+// TODO: There's no reason to have HeadDim as template parameter,
+// it should be a constexpr defined in a header which can be used
+// by mla_api.cpp to check input sizes.
 template<int QTileM, int QTileK, int CTileN, int HeadDim, int NumStages = 3>
 __global__ void mla_decode_fused(const float *__restrict__ Q,
                                  const float *__restrict__ C,
@@ -52,14 +51,13 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
     extern __shared__ float shmem[];
 
     float *Qs = shmem;
+    // TODO: Padding Cs causes excessive gmem accesses -> use swizzling
     float *Cs = Qs + QTileM * HeadDim;
-    // TODO: Padding Cs causes excessive shared accesses
+    // Ps has shape (num_warps, QTileM, CTileN)
     float *Ps = Cs + (HeadDim + 4) * CTileN;
 
     const int num_warps = QTileM * CTileN / WARP_SIZE;
     const int warp_id = threadIdx.y;
-
-    // Ps has shape (num_warps, QTileM, CTileN)
 
     for (int i = blockDim.x * threadIdx.y + threadIdx.x;
              i < QTileM * HeadDim; i += QTileM * CTileN) {
@@ -73,11 +71,6 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
     // Tiled loop over attn matrix cols
     for (int C_j = 0; C_j < N; C_j += CTileN) {
-        // NOTE: High barrier stall here due to 576 not being
-        // divisible by num_warps * 64 in PC product loop
-        // I have too many warps with respect to the size of
-        // the tiles..
-
         // Load Cs once, reuse it for the projection
         // Should I worry about transposing Cs?
 
@@ -203,12 +196,14 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         __syncthreads();
 
         for (int j = 2 * warp_id * CTileN;
-                 j < HeadDim; j += 2 * CTileN * num_warps) {
+                 j < HeadDim - 64; j += 2 * CTileN * num_warps) {
 
             // Each thread computes two adjacent
             // columns of the resulting tile
             float col_1[QTileM];
             float col_2[QTileM];
+            // TODO: four column coarsening would be beneficial
+            // if 4 warps weren't idle
 
             // Online softmax correction
             #pragma unroll
@@ -216,7 +211,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
                 float norm_coef = norm_coefs[m];
                 // Force 8 byte loads to allow coalescing
                 float2 O_curr = reinterpret_cast<float2 *>(O)[
-                    (blockIdx.y * QTileM + m) * HeadDim / 2
+                    (blockIdx.y * QTileM + m) * (HeadDim - 64) / 2
                         + j / 2 + threadIdx.x];
 
                 col_1[m] = O_curr.x * norm_coef;
@@ -240,7 +235,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             for (int m = 0; m < QTileM; ++m) {
                 float2 O_new = { col_1[m], col_2[m] };
                 reinterpret_cast<float2 *>(O)[
-                    (blockIdx.y * QTileM + m) * HeadDim / 2
+                    (blockIdx.y * QTileM + m) * (HeadDim - 64) / 2
                         + j / 2 + threadIdx.x] = O_new;
             }
         }
@@ -248,8 +243,8 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         __syncthreads(); // Wait before reusing Cs
     }
 
-    for (int j = 0; j < HeadDim; j += CTileN) {
-        O[(blockIdx.y * QTileM + threadIdx.y) * HeadDim +
+    for (int j = 0; j < HeadDim - 64; j += CTileN) {
+        O[(blockIdx.y * QTileM + threadIdx.y) * (HeadDim - 64) +
             j + threadIdx.x] /= prev_sum;
     }
 }

@@ -60,6 +60,7 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 |kernel|time (ms)| peak flops (fp32) |
 |:-----|---:|---:|
 |pytorch eager                                         |0.434|48%|
+|pytorch eager (head_dim_v fix)                        |0.446|48%|
 ||
 | (fused) vectorized C load with unroll 4              |1.190|13%|
 | + padding Cs to avoid bank conflicts                 |0.934|16%|
@@ -67,6 +68,7 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 | + 3-stage pipeline to load C                         |0.769|20%|
 | + two cols coarsening for PC product                 |0.664|22%|
 | + two cols coarsening for QC^T product [`QTileK=8`]  |0.641|24%|
+| + head_dim_v fix :P                                  |0.566|25%|
 
 - Using shmem to accumulate output results degrades performance apparently.
 - I think I've to quickly move to fp16, otherwise shmem isn't enough!
@@ -76,13 +78,30 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 - It looks like vectorized shmem loads (LDS.128) broadcast require two wavefronts (and not 4?), that's why
 they appear like they are producing bank conflicts.
 
+- The docs state that cp.async achieves best performance when both src and dst are 128 bytes aligned, shmem can be aligned with `extern __shared__ char shmem[] alignas(128);`, while gmem allocations should already be 256 bytes aligned, but using `QTileK=8`, only 4/8 warps load C tiles at 128 bytes boundaries.
+Weirdly enough, the uncoalesced gmem accesses are caused only by the presence of 16 byte padding in Cs (in shared memory!), which causes tiles rows to be split across 32 byte sectors, it is sufficient to use 32 byte padding to avoid them. Perhaps if the cp.async shmem store has to be split in multiple accesses, also the gmem access has to be performed in multiple transactions.
+The uncoalesced shared accesses are instead caused by Cs tiles misalignment to 128 byte boundaries, which can be fixed by explicitly aligning shmem buffers, using `QTileK=16` and avoid padding Cs.
+Note here that we are using 16 byte cp.async instructions, using the 8 byte variant the 16 byte padding of Cs doesn't generate excessive global loads, but in that casee it seems like there's no way to avoid the excessive shared wavefronts (perhaps that's why they say that best performance is achieved with the 16 byte version). Perhaps only the 16 byte version suffers from the coupling between shmem tiles aligment and gmem excessive accesses.
+TLDR; prefer `QTileK=16` when using two col coarsening, use `alignas(128)` on shmem buffer and either avoid padding for Cs, or use a padding multiple of 32 bytes.
+
+- I can swizzle within each tile; with two col coarsening, each warp accesses a tile (16, QTileK), one column after the other. The swizzle has to keep 128 bit words intact, so it has to be performed at the granularity of float4. Note that for 128 bit shared requests, the access is split in 4 cycles, each serving 8 consecutive threads in the warp. It is then sufficient to avoid bank conflicts for 128 bit words within each quarter warp (0-7, 8-15, 16-23, 24-31). Two col coarsening is fine here, since half warps are already avoiding bank conflicts with 128 bit accesses.
+
+- An attempt to reduce the barrier stalls: For the QC^T product, using two col coarsening only for the first 512 columns, such that the last 64 ones can be processed by all warps (with `QTileK=8`) increases the sync overhead (due to an additional `__syncthreads()`), bringing no performance increase (even when removing the need of `__synchtreads()` by changing the prefetch behavior such that only a `syncwarp()` is required).
+
+- Four col coarsening for PC product reduces short scoreboard and MIO throttle, but 4 warps remain idle, increasing barrier stalls (no increase in performance). With `QTileM=16`, those 4 warps could be used! What if C gets loaded again for the PC product? I could increase `QTileM` then, but note that split-k will be a must. I could load Cs in two chunks, for the PC product the second chunk could be immediately reused while the other could be asynchronously copied.
+
 ## TODO
 
-- Slice-k with more than 8 warps or two column coarsening for QC^T.
+- Avoid Cs padding.
+- Choose a number of warps that divides evenly Cs size -> 9 should be good, but it doesn't seem to reduce overall sync stalls for some reason.. only for the PC loop. I guess sync latency could be hidden by fitting two blocks on each SM.
+
+- Slice-k with more than 8 warps -> tried with 9, sync latency after QC^T loop increases.
 - 2D coarsening -> increase QTileM.
 - Move to fp16 to reduce shmem requirements and fit two blocks in each SM.
 - Split-k.
-- Try to pipeline shmem->reg loads.
+- Try to pipeline shmem->reg loads (how the hell?)
+
+- 
 
 ## Roadmap
 

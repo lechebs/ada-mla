@@ -40,7 +40,7 @@ at::Tensor mla_decode_fused(const at::Tensor &query,
     const at::Device dev = query.device();
     at::TensorOptions options = at::TensorOptions().device(dev);
     // TODO: Fill with zeros inside the kernel
-    at::Tensor out = at::zeros(q_size, options);
+    at::Tensor out = at::zeros({ q_size[0], q_size[1] - 64 }, options);
 
     float *o_ptr = static_cast<float *>(out.data_ptr());
     const float *q_ptr = static_cast<float *>(query.data_ptr());
