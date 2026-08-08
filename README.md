@@ -59,16 +59,19 @@ Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread
 Moving to ncu execution time (more precises, flushes caches at each iteration).
 |kernel|time (ms)| peak flops (fp32) |
 |:-----|---:|---:|
-|pytorch eager                                         |0.434|48%|
-|pytorch eager (head_dim_v fix)                        |0.446|48%|
+|pytorch eager                                                               |0.434|48%|
+|pytorch eager (head_dim_v fix)                                              |0.446|48%|
 ||
-| (fused) vectorized C load with unroll 4              |1.190|13%|
-| + padding Cs to avoid bank conflicts                 |0.934|16%|
-| + 2-stage pipeline to load C                         |0.795|19%|
-| + 3-stage pipeline to load C                         |0.769|20%|
-| + two cols coarsening for PC product                 |0.664|22%|
-| + two cols coarsening for QC^T product [`QTileK=8`]  |0.641|24%|
-| + head_dim_v fix :P                                  |0.566|25%|
+| (fused) vectorized C load with unroll 4                                    |1.190|13%|
+| + padding Cs to avoid bank conflicts                                       |0.934|16%|
+| + 2-stage pipeline to load C                                               |0.795|19%|
+| + 3-stage pipeline to load C                                               |0.769|20%|
+| + two cols coarsening for PC product                                       |0.664|22%|
+| + two cols coarsening for QC^T product [`QTileK=8`]                        |0.641|24%|
+| + head_dim_v fix :P                                                        |0.566|25%|
+| + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|31%|
+
+(*excluding splitkv reduce kernel)
 
 - Using shmem to accumulate output results degrades performance apparently.
 - I think I've to quickly move to fp16, otherwise shmem isn't enough!
@@ -89,6 +92,12 @@ TLDR; prefer `QTileK=16` when using two col coarsening, use `alignas(128)` on sh
 - An attempt to reduce the barrier stalls: For the QC^T product, using two col coarsening only for the first 512 columns, such that the last 64 ones can be processed by all warps (with `QTileK=8`) increases the sync overhead (due to an additional `__syncthreads()`), bringing no performance increase (even when removing the need of `__synchtreads()` by changing the prefetch behavior such that only a `syncwarp()` is required).
 
 - Four col coarsening for PC product reduces short scoreboard and MIO throttle, but 4 warps remain idle, increasing barrier stalls (no increase in performance). With `QTileM=16`, those 4 warps could be used! What if C gets loaded again for the PC product? I could increase `QTileM` then, but note that split-k will be a must. I could load Cs in two chunks, for the PC product the second chunk could be immediately reused while the other could be asynchronously copied.
+- Four col coarsening for QC^T product shifts the stalls from short scoreboard and MIO throttle to long scoreboard and LG throttle (even when reducing `QTileK` such that each warp always prefetches a (`QTileM`, 32) tile), bringing no performance improvement. I guess increasing `QTileM` would be beneficial to reduce gmem access penalties; from there four col coarsening could actually help (or at least allow to not reduce `QTileK`, such that more of `HeadDim` could be processed in parallel by the warp).
+
+- Revert to `QTileM=CTileN=16`. It would be great not to reduce `CTileN`, but there wouldn't be enough shmem. This configuration should increase the AI of gmem access wrt to `QTileM=8`, `CTileN=32`. Note that the AI wrt to gmem access is determined only by the first gemm, since for the second one, everything is in shmem. But we could say that throughput of computing the Ps tile is a form of bandwidth that could limit the throughput of the second gemm, so we could talk about AI even in that case. Most notably, the width of the Ps tile (`CTileN`) has no effect on this AI, since it is the k dimension of the gemm, while the height (`QTileM`) does.
+It is easy to visualize why a larger `QTileM` would be beneficial, the same Cs tile can be reused for a taller tile of the output. Doubling the size of `QTileM`, C will be fetched half the number of times as before. The size of `CTileN` influences only the AI at the shmem access level I guess, since at the end of the day each block has to fetch all of C from gmem, differently from a standard gemm. Initially I moved to smaller `QTileM` values since anything more than 8 would not use all of the SMs, and looking back at the speedup obtained, it is less than 2x, which fits with the idea that this speedup was only due to the usage of all of the SMs (from 8 to 16). A smaller `CTileN` size can help hide better the latency of loading Cs (with increased `QTileM`).
+
+- Move the prefetching of C before the final `__syncthreads()`, or check if you can let each warp work only on a specific subset of chunks from Cs, for both products, in order to avoid block level synchronization.
 
 ## TODO
 
@@ -100,8 +109,6 @@ TLDR; prefer `QTileK=16` when using two col coarsening, use `alignas(128)` on sh
 - Move to fp16 to reduce shmem requirements and fit two blocks in each SM.
 - Split-k.
 - Try to pipeline shmem->reg loads (how the hell?)
-
-- 
 
 ## Roadmap
 
