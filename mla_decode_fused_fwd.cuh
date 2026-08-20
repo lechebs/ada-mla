@@ -10,16 +10,17 @@ __device__ __forceinline__ void pipeline_prefetch_kv_tile(
     const float *__restrict__ gmem_src,
     float *__restrict__ shmem_dst,
     int lane_idx,
-    int num_t_per_slice)
+    int num_slices_per_warp)
 {
-    // NOTE: threadIdx.x could be summed to j to avoid branches
-    // but ultimately lowers the performance due to lg throttling
+    // The warp now prefetchs the entire chunk, without letting each half warp
+    // load its slice.
     #pragma unroll
-    for (int j = lane_idx % num_t_per_slice;
-             j < QTileK * CTileN / 4; j += num_t_per_slice) {
+    for (int j = lane_idx;
+             j < num_slices_per_warp * QTileK * CTileN / 4; j += WARP_SIZE) {
+
         // Coordinates within the tile
-        const int tile_i = j / (QTileK / 4);
-        const int tile_j = j % (QTileK / 4);
+        const int tile_i = j / (2 * QTileK / 4);
+        const int tile_j = j % (2 * QTileK / 4);
 
         const float *src = gmem_src + tile_i * HeadDim + 4 * tile_j;
         // Convert generic pointer to shared space state
@@ -38,6 +39,9 @@ __device__ __forceinline__ void pipeline_prefetch_kv_tile(
             sizeof(float4));
         */
     }
+
+    // NOTE: ptx shows that an additional predicated cp.async is being
+    // placed here (after the unrolled two), it's messing up ncu stats
 }
 
 // TODO: There's no reason to have HeadDim as template parameter,
@@ -110,12 +114,19 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
         const int num_slices_per_warp = WARP_SIZE / num_t_per_slice;
 
         // thread tile coordinates
-        const int tx = (lane_idx % num_t_per_slice) % num_t_cols;
-        const int ty = (lane_idx % num_t_per_slice) / num_t_cols;
+        // WARNING: Harcoded for QK=CN=16 TN=2 TM=8
+        const int tx = (lane_idx % num_t_per_slice) % QTileK;
+        const int ty = lane_idx / 16;
+
+        //const int tx = (lane_idx % num_t_per_slice) % num_t_cols;
+        //const int ty = (lane_idx % num_t_per_slice) / num_t_cols;
 
         const int stage_width = num_slices_per_warp * QTileK * num_warps;
-        const int warp_c_offset = num_slices_per_warp * QTileK * warp_idx +
-                                  QTileK * (lane_idx / num_t_per_slice);
+        const int warp_c_offset = num_slices_per_warp * QTileK * warp_idx;// +
+                                  //QTileK * (lane_idx / num_t_per_slice);
+
+        const int slice_offset =
+            QTileK * ((lane_idx % num_t_per_slice) / QTileK);
 
         #pragma unroll
         for (int s = 0; s < NumStages - 1; ++s) {
@@ -126,7 +137,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             pipeline_prefetch_kv_tile<QTileK, CTileN, HeadDim>(
                 C + C_j * HeadDim + warp_c_offset + s * stage_width,
                 Cs + warp_c_offset + s * stage_width,
-                lane_idx, num_t_per_slice);
+                lane_idx, num_slices_per_warp);
             __pipeline_commit();
         }
 
@@ -144,7 +155,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
                 pipeline_prefetch_kv_tile<QTileK, CTileN, HeadDim>(
                     C + C_j * HeadDim + Q_j + (NumStages - 1) * stage_width,
                     Cs + Q_j + (NumStages - 1) * stage_width,
-                    lane_idx, num_t_per_slice);
+                    lane_idx, num_slices_per_warp);
             }
 
             // Commit even when pipeline is empty for better codegen
@@ -154,22 +165,24 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             __pipeline_wait_prior(NumStages - 1); // cp.async.wait_group N;
             __syncwarp();
 
+            float Qr[TM][QTileK];
+
             for (int k = 0; k < QTileK; ++k) {
-
-                float Cr[TN];
-                #pragma unroll
-                for (int n = 0; n < TN; ++n) {
-                    // Tile Cs row into registers
-                    Cr[n] = Cs[(n * num_t_cols + tx) *
-                               (HeadDim + 4) + Q_j + k];
-                }
-
                 #pragma unroll
                 for (int m = 0; m < TM; ++m) {
-                    float Qr = Qs[(ty * TM + m) * HeadDim + Q_j + k];
+                    Qr[m][k] = Qs[(ty * TM + m) * HeadDim +
+                                  Q_j + slice_offset + k];
+                }
+            }
+
+            for (int k = 0; k < QTileK; ++k) {
+                #pragma unroll
+                for (int n = 0; n < TN; ++n) {
+                    float Cr = Cs[(n * num_t_cols + tx) *
+                                  (HeadDim + 4) + Q_j + slice_offset + k];
                     #pragma unroll
-                    for (int n = 0; n < TN; ++n) {
-                        logs[m][n] += Cr[n] * Qr;
+                    for (int m = 0; m < TM; ++m) {
+                        logs[m][n] += Cr * Qr[m][k];
                     }
                 }
             }
@@ -180,15 +193,21 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             #pragma unroll
             for (int n = 0; n < TN; ++n) {
                 // Reduce wrt to the other warp slices
+                /*
                 #pragma unroll
                 for (int s = num_slices_per_warp; s > 1; s >>= 1) {
                     logs[m][n] +=
                         __shfl_xor_sync(0xffffffff, logs[m][n], WARP_SIZE / s);
                 }
+                */
+                // WARNING: Works for QM=CN=8 TN=2 TM=8
+                logs[m][n] +=
+                    __shfl_xor_sync(0xffffffff, logs[m][n], 8);
             }
         }
 
-        if (lane_idx < num_t_per_slice) {
+        // NOTE: no need to guard, all threads have the accumulated values
+        //if (lane_idx < num_t_per_slice) {
             #pragma unroll
             for (int m = 0; m < TM; ++m) {
                 const int warp_offset = QTileM * CTileN * warp_idx;
@@ -203,7 +222,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
                                    + tx + n * num_t_cols] = logs[m][n];
                 }
             }
-        }
+        //}
 
         __syncthreads();
 
@@ -268,7 +287,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             col_4[m] *= norm_coef;
         }
 
-        // NOTE: These loads were not vectorized anymore,
+        // NOTE: Ps loads were not vectorized anymore,
         // but swapping the loop order is enough to bring them back!
         // (otherwise transposing Ps would work as well).
         #pragma unroll
@@ -280,7 +299,11 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
                     k * (HeadDim + 4) / 4 +
                         (warp_idx % num_warp_tiles_x) * WARP_SIZE + lane_idx];
 
+                    // TODO: Consider transposing Ps, it seems beneficial
+                    // even if we are already able to issue 128 bit loads.
+                    //float P_val = Ps[k * QTileM + t_row * TM_pc + m];
                     float P_val = Ps[(t_row * TM_pc + m) * CTileN + k];
+
 
                     col_1[m] += P_val * C_val.x;
                     col_2[m] += P_val * C_val.y;

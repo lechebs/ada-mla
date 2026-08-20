@@ -69,7 +69,8 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 | + two cols coarsening for PC product                                       |0.664|22%|
 | + two cols coarsening for QC^T product [`QTileK=8`]                        |0.641|24%|
 | + head_dim_v fix :P                                                        |0.566|25%|
-| + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|31%|
+| + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|33%|
+| + avoid Qs bank conflicts + avoid Ps store conditional + full Qr tiling   |*0.404|36%|
 
 (*excluding splitkv reduce kernel)
 
@@ -98,6 +99,15 @@ TLDR; prefer `QTileK=16` when using two col coarsening, use `alignas(128)` on sh
 It is easy to visualize why a larger `QTileM` would be beneficial, the same Cs tile can be reused for a taller tile of the output. Doubling the size of `QTileM`, C will be fetched half the number of times as before. The size of `CTileN` influences only the AI at the shmem access level I guess, since at the end of the day each block has to fetch all of C from gmem, differently from a standard gemm. Initially I moved to smaller `QTileM` values since anything more than 8 would not use all of the SMs, and looking back at the speedup obtained, it is less than 2x, which fits with the idea that this speedup was only due to the usage of all of the SMs (from 8 to 16). A smaller `CTileN` size can help hide better the latency of loading Cs (with increased `QTileM`).
 
 - Move the prefetching of C before the final `__syncthreads()`, or check if you can let each warp work only on a specific subset of chunks from Cs, for both products, in order to avoid block level synchronization.
+
+-  When accessing Qs, broadcast/multicast 128 bit loads can be served in a minimum of 2 wavefronts. Bank conflicts occur in each half warp (so if threads 0-7 access the same bank as threads 8-15), but not across half warps. At least when each quarter warp is accessing in multicast the same 16 byte word.
+
+- When loading C into Cs using cp.async, since each group of consecutive threads access two different cache lines (2 sectors from each, 2*QTileK spans 64 bytes), the store to shmem for each group of consecutive 8 threads can't be made in a single wavefront, that's why we get 8 wavefronts per LDGSTS.128 (instead of the expected 4, which we get if we access entire cache lines from gmem). The thing is that we don't get conflicts within each group of consecutive 8 threads, so that's the only explanation I can come up with. Remember that 128 bit loads from shmem ideally happen in 4 wavefront usually (when no broadcast/multicast is happening), so one should worry only about conflicts within quarter warps.
+Anyhow, removing those conflicts doesn't increase performance currently, it just shifts the stalls somewhere else.
+
+- I should check whether I am already accessing Cs in the best way possible, or if there are any conflicts. Apart from that I'd like to hide better the long scoreboard stalls.
+
+- Can I start prefetching C while performing the PC product? I guess I could let each warp work on the same exact chunk of Cs, it would be easier. So prefetch immediately the (CTileN, 2 * QTileK) tile after having performed the PC product. Perhaps then writing to O would suffer a bit, but I can try.
 
 ## TODO
 
@@ -141,6 +151,8 @@ Compare against flash-attention decoding, FlashMLA doesn't support Ada.
 - https://www.spatters.ca/mma-matmul
 - https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html
 - https://gau-nernst.github.io/fa-5090/
+- https://salykova.github.io/sgemm-gpu
+- https://www.aleksagordic.com/blog/matmul
 
 - https://github.com/NVIDIA/cutlass#documentation
 - https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html
