@@ -40,8 +40,8 @@ at::Tensor mla_decode_fused(const at::Tensor &query,
     const at::Device dev = query.device();
     at::TensorOptions options = at::TensorOptions().device(dev);
     // TODO: Fill with zeros inside the kernel
-    // NOTE: No need if pc can be accumulated into registers
-    at::Tensor out = at::zeros({ q_size[0], q_size[1] - 64 }, options);
+    // NOTE: No need to fill with zeros if pc can be accumulated into registers
+    at::Tensor out = at::empty({ q_size[0], q_size[1] - 64 }, options);
 
     float *o_ptr = static_cast<float *>(out.data_ptr());
     const float *q_ptr = static_cast<float *>(query.data_ptr());
@@ -54,11 +54,11 @@ at::Tensor mla_decode_fused(const at::Tensor &query,
 }
 
 template<typename Scalar>
-void mla_decode_splitkv_(const at::Tensor &query,
-                         const at::Tensor &cache,
-                         at::Tensor &out,
-                         at::TensorOptions options,
-                         int num_splits)
+void mla_decode_split_(const at::Tensor &query,
+                       const at::Tensor &cache,
+                       at::Tensor &out,
+                       at::TensorOptions options,
+                       int num_splits)
 {
     Scalar *o_ptr = out.data_ptr<Scalar>();
     const Scalar *q_ptr = query.data_ptr<Scalar>();
@@ -72,35 +72,35 @@ void mla_decode_splitkv_(const at::Tensor &query,
     at::Tensor splits_sum = at::empty({ num_splits, num_heads }, options);
     // Each split needs its own output tensor (note that out could be reused)
     at::Tensor splits_out = at::empty(
-        { num_splits, num_heads, head_dim_c }, options);
+        { num_splits, num_heads, head_dim_c - 64 }, options);
 
     Scalar *splits_max_ptr = splits_max.data_ptr<Scalar>();
     Scalar *splits_sum_ptr = splits_sum.data_ptr<Scalar>();
     Scalar *splits_out_ptr = splits_out.data_ptr<Scalar>();
 
-    run_mla_decode_splitkv<Scalar>(
+    run_mla_decode_splitk<Scalar>(
         q_ptr, c_ptr, o_ptr, splits_max_ptr, splits_sum_ptr, splits_out_ptr,
-        num_splits, num_heads, head_dim_c, seq_length);
+        num_splits, num_heads, seq_length);
 }
 
-at::Tensor mla_decode_splitkv(const at::Tensor &query,
-                              const at::Tensor &cache)
+at::Tensor mla_decode_split(const at::Tensor &query,
+                            const at::Tensor &cache)
 {
     // todo: refactor common logic with mla_decode_naive
 
     at::TensorOptions options =
         at::TensorOptions().device(query.device()).dtype(query.scalar_type());
-    at::Tensor out = at::zeros(query.sizes(), options);
+    at::Tensor out = at::empty({ query.size(0), query.size(1) - 64 }, options);
 
-    const int num_splits = 1;
+    const int num_splits = 4;
 
     // dispatch based on dtype
     switch (query.scalar_type()) {
         case at::kFloat:
-            mla_decode_splitkv_<float>(query, cache, out, options, num_splits);
+            mla_decode_split_<float>(query, cache, out, options, num_splits);
             break;
         case at::kHalf:
-            mla_decode_splitkv_<at::Half>(
+            mla_decode_split_<at::Half>(
                 query, cache, out, options, num_splits);
             break;
         default:
@@ -114,5 +114,5 @@ PYBIND11_MODULE(ada_mla, m)
 {
     m.def("mla_decode_naive", &mla_decode_naive);
     m.def("mla_decode_fused", &mla_decode_fused);
-    m.def("mla_decode_split", &mla_decode_splitkv);
+    m.def("mla_decode_split", &mla_decode_split);
 }

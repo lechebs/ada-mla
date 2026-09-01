@@ -23,13 +23,12 @@ void run_mla_decode_fused(const float *query,
                           int seq_length);
 
 template<typename Scalar>
-void run_mla_decode_splitkv(const Scalar *query,
-                            const Scalar *cache,
-                            Scalar *out,
-                            Scalar *splits_max,
-                            Scalar *splits_sum,
-                            Scalar *splits_out,
-                            int num_splits,
-                            int num_heads,
-                            int head_dim_c,
-                            int seq_length);
+void run_mla_decode_splitk(const Scalar *query,
+                           const Scalar *cache,
+                           Scalar *out,
+                           Scalar *splits_max,
+                           Scalar *splits_sum,
+                           Scalar *splits_out,
+                           int num_splits,
+                           int num_heads,
+                           int seq_length);

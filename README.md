@@ -60,7 +60,7 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 |kernel|time (ms)| peak flops (fp32) |
 |:-----|---:|---:|
 |pytorch eager                                                               |0.434|48%|
-|pytorch eager (head_dim_v fix)                                              |0.446|48%|
+|pytorch eager (head_dim_v fix)                                              |0.357|48%|
 ||
 | (fused) vectorized C load with unroll 4                                    |1.190|13%|
 | + padding Cs to avoid bank conflicts                                       |0.934|16%|
@@ -71,7 +71,6 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 | + head_dim_v fix :P                                                        |0.566|25%|
 | + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|33%|
 | + avoid Qs bank conflicts + avoid Ps store conditional + full Qr tiling   |*0.404|36%|
-
 (*excluding splitkv reduce kernel)
 
 - Using shmem to accumulate output results degrades performance apparently.
@@ -108,6 +107,31 @@ Anyhow, removing those conflicts doesn't increase performance currently, it just
 - I should check whether I am already accessing Cs in the best way possible, or if there are any conflicts. Apart from that I'd like to hide better the long scoreboard stalls.
 
 - Can I start prefetching C while performing the PC product? I guess I could let each warp work on the same exact chunk of Cs, it would be easier. So prefetch immediately the (CTileN, 2 * QTileK) tile after having performed the PC product. Perhaps then writing to O would suffer a bit, but I can try.
+
+- Use 4 warps instead of 8, it looks like it suffers less long scoreboard stalls. At that point you can increaseTN to 4. Then perhaps shmem->reg pipelining?
+- try 8x8 for PC product at this point
+
+- For shmem 128 bit multicast to require the minimum amount of wavefronts, contiguous threads have to access the same word!
+
+- The best I can get is 2 wavefronts for Cs and 4 wavefronts for Qs or viceversa, multicast requiring contiguity of threads is a pain in the neck. I can't get the 4x4 thread tile for QC^T to perform better than the 8x2, bank conflicts are easier to deal with for the 8x2 version.
+
+- Double buffering Cs and prefetching the entire Cs tile avoids long scoreboard stalls much better than the intra tile pipeline, which was basically being "flushed" for each iteration over the sequence length. The effective CTileN halvens though, I guess it's a good compromise for the fp16 version.
+
+- Pipelining shmem to regs loads doesn't seem to have an effect on scoreboard stalls. The resulting ptx changes, but the SASS looks basically the same, as well as the number of registers used. __syncwarp() or cta.membar can be used to force the ordering between loads and mma loop, but then the MIO throttle stalls spike, so I guess ptxas is already doing some kind of pipelining by exploiting ILP from the unrolled loops. Note however that tiling explicitly an entire fragment into registers before consuming it in the mma loop can still be beneficial.
+
+- Short scoreboard stalls are present even while performing in warp butterfly reduction to compute the softmax, I think having more
+rows to process per warp would allow be beneficial in terms of ILP, which can be done for the fp16 version, were the block size is smaller wrt to the Ps tile.
+
+- torch fp16 gemms appear memory bound wrt tensor cores flops. This could give an edge to the fused kernel, at least on a GPU with very limited bandwidth, like the RTX 500 Ada (128GB/s). The fact that the gemms are tall-and-skinny (lower AI) is now becoming apparent due to the higher peak flops of tensor cores. That's probably also why torch in fp32 can't reach more than 50% peak flops. 
+
+- Loading naively with LDS each 8x8 tile for mma and using ldmatrix without any swizzling results in the same number of wavefronts, interestingly though ncu reports 128 bit access size for LDSM instructions, so perhaps not all threads are active during a LDSM instruction? The ISA requires threads 0-7 to provide the ptr to the start of rows 0-7 of the matrix, so perhaps only those threads actually access the shmem, each loading one entire row with a 128 bit access granularity. But what would be the point of ldmatrix then? Each group of 4 contiguous threads could load the corrisponding row in multicast with LDS.128, and then each thread could discard the values that it doesn't need. Perhaps x2 and x4 ldmatrix variants use respectively 16 and 32 threads, if each quarter warp is assigned to a 8x8 matrix. In that case I can see why ldmatrix would be superior, if it still maps to a single SASS instruction.
+This intuiton is confirmed by the ptx docs: "When reading 8x8 matrices, a group of four consecutive threads loads 16 bytes." So to benefit from ldmatrix, apart from swizzling, it would be better to use the x4 version." and "When .num = .x2, the elements of the second matrix are loaded in the next destination register in each thread as per the layout in above table. Similarly, when .num = .x4, elements of the third and fourth matrices are loaded in the subsequent destination registers in each thread"
+
+- Lots of IMAD instructions between HMMA, see this: https://forums.developer.nvidia.com/t/the-number-of-imad-instructions-blow-up-after-changing-to-m16n8k16-mma/351316/4
+
+- Try to estimate how much peak flops can theoretically be achieved on the rtx 500 ada for the gemms in the mla computation, to have a more meaningful view on the obtained flops.
+
+- Benchmark also with a bigger batch size.
 
 ## TODO
 
