@@ -49,6 +49,8 @@ struct KernelTraits<__half>
     static constexpr int HeadDimK = 576;
     static constexpr int HeadDimV = 512;
 
+    static constexpr int NumHeads = 128;
+
     static constexpr int NumWarps = 4;
     static constexpr int NumThreads = NumWarps * WARP_SIZE;
 
@@ -57,82 +59,6 @@ struct KernelTraits<__half>
     static constexpr int VecLen = 8;
 };
 
-template<typename Scalar>
-struct SharedMemory
-{
-    // TODO: Template on alloc alignment?
-    __device__ __forceinline__ Scalar *alloc_tile(std::size_t size)
-    {
-        // Note that 128 byte alignment for shmem should increase
-        // cp.async performance, but with 4 byte alignment the
-        // throughput remains the same
-        extern __shared__ __align__(128) unsigned char shmem[];
-
-        Scalar *ptr = reinterpret_cast<Scalar *>(shmem + offset);
-
-        offset += size * sizeof(Scalar);
-
-        return ptr;
-    }
-
-private:
-    uint64_t offset = 0;
-};
-
-template<typename Traits>
-__device__ __forceinline__
-void ldg_Q_tile(const void *__restrict__ Q_gmem,
-                void *__restrict__ Q_shmem)
-{
-    #pragma unroll
-    for (int i = 0;
-             i < Traits::BlockM * Traits::HeadDimK / Traits::VecLen;
-             i += Traits::NumThreads)
-    {
-        const int idx = i + threadIdx.x;
-
-        reinterpret_cast<float4 *>(Q_shmem)[idx] =
-            reinterpret_cast<const float4 *>(Q_gmem)[
-                (Traits::BlockM * blockIdx.y) * Traits::HeadDimK /
-                Traits::VecLen + idx];
-    }
-}
-
-template<typename Traits>
-__device__ __forceinline__
-void cp_async_ldgsts_C_tile(const typename Traits::Scalar *__restrict__ C_gmem_src,
-                            typename Traits::Scalar *__restrict__ C_shmem_dst)
-{
-    constexpr int VecLen = Traits::VecLen;
-    constexpr int HeadDimK = Traits::HeadDimK;
-
-    #pragma unroll
-    for (int j = 0;
-             j < Traits::BlockN * HeadDimK / VecLen;
-             j += Traits::NumThreads) {
-
-        const int idx = j + threadIdx.x;
-
-        const typename Traits::Scalar *src = C_gmem_src + VecLen * idx;
-        // Convert generic pointer to shared space state
-        const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(
-            C_shmem_dst + VecLen * idx));
-
-        asm volatile ("cp.async.cg.shared.global [%0], [%1], 16;"
-                      :: "r"(dst), "l"(src));
-    }
-}
-
-__device__ __forceinline__ void cp_async_commit()
-{
-    asm volatile ("cp.async.commit_group;");
-}
-
-template<int N>
-__device__ __forceinline__ void cp_async_wait()
-{
-    asm volatile ("cp.async.wait_group %0;" :: "n"(N));
-}
 
 /*
  * - grid tiles:
@@ -274,6 +200,81 @@ __device__ __forceinline__ void cp_async_wait()
  *
  */
 
+template<typename Scalar>
+struct SharedMemory
+{
+    // TODO: Template on alloc alignment?
+    __device__ __forceinline__ Scalar *alloc_tile(std::size_t size)
+    {
+        // Note that 128 byte alignment for shmem should increase
+        // cp.async performance, but with 4 byte alignment the
+        // throughput remains the same
+        extern __shared__ __align__(128) unsigned char shmem[];
+
+        Scalar *ptr = reinterpret_cast<Scalar *>(shmem + offset);
+        offset += size * sizeof(Scalar);
+
+        return ptr;
+    }
+
+private:
+    uint64_t offset = 0;
+};
+
+template<typename Traits>
+__device__ __forceinline__
+void ldg_Q_tile(const void *__restrict__ Q_gmem,
+                void *__restrict__ Q_shmem)
+{
+    #pragma unroll
+    for (int i = 0;
+             i < Traits::BlockM * Traits::HeadDimK / Traits::VecLen;
+             i += Traits::NumThreads)
+    {
+        const int idx = i + threadIdx.x;
+        reinterpret_cast<float4 *>(Q_shmem)[idx] =
+            reinterpret_cast<const float4 *>(Q_gmem)[
+                (Traits::BlockM * blockIdx.y) * Traits::HeadDimK /
+                Traits::VecLen + idx];
+    }
+}
+
+template<typename Traits>
+__device__ __forceinline__
+void cp_async_ldgsts_C_tile(const typename Traits::Scalar *__restrict__ C_gmem_src,
+                            typename Traits::Scalar *__restrict__ C_shmem_dst)
+{
+    constexpr int VecLen = Traits::VecLen;
+    constexpr int HeadDimK = Traits::HeadDimK;
+
+    #pragma unroll
+    for (int j = 0;
+             j < Traits::BlockN * HeadDimK / VecLen;
+             j += Traits::NumThreads) {
+
+        const int idx = j + threadIdx.x;
+
+        const typename Traits::Scalar *src = C_gmem_src + VecLen * idx;
+        // Convert generic pointer to shared space state
+        const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(
+            C_shmem_dst + VecLen * idx));
+
+        asm volatile ("cp.async.cg.shared.global [%0], [%1], 16;"
+                      :: "r"(dst), "l"(src));
+    }
+}
+
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile ("cp.async.commit_group;");
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait()
+{
+    asm volatile ("cp.async.wait_group %0;" :: "n"(N));
+}
+
 template<bool Trans = false>
 __device__ __forceinline__ void ldmatrix_sync_m8n8_x2_b16(const float *src,
                                                           float frag[2])
@@ -390,7 +391,6 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
     // may need to be revisited in case of shmem swizzling
 
     constexpr int WarpTileHeight = Traits::BlockM / Traits::NumWarps;
-    constexpr int NumSlices = Traits::NumWarps;
     constexpr int SliceWidth = Traits::BlockN;
     constexpr int SliceHeight = Traits::BlockM;
 
@@ -517,6 +517,25 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
         *reinterpret_cast<float2 *>(&P_batch[chunk][has_upp * 2]);
 }
 
+template<typename Traits>
+__device__ __forceinline__
+void stg_O_tile_split(const typename Traits::Scalar *__restrict__ O_shmem,
+                      typename Traits::Scalar *__restrict__ O_split_gmem)
+{
+    // Quite similar to ldg_Q_tile, consider having a generic function
+    #pragma unroll
+    for (int i = 0;
+             i < Traits::BlockM * Traits::HeadDimV / Traits::VecLen;
+             i += Traits::NumThreads)
+    {
+        const int idx = i + threadIdx.x;
+        reinterpret_cast<float4 *>(O_split_gmem)[
+            Traits::BlockM * blockIdx.y *
+                Traits::HeadDimV / Traits::VecLen + idx] =
+                    reinterpret_cast<const float4 *>(O_shmem)[idx];
+    }
+}
+
 template<typename KernelTraits>
 __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
                                            const __half *__restrict__ C,
@@ -566,6 +585,8 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
     float O_frag[NumMmasOutY * NumMmasOutX][2];
 
+    // block_reduce_P_softmax() specifies the thread to row
+    // mapping for these values
     __half2 prev_row_sum = __half2half2(CUDART_ZERO_FP16);
     __half2 prev_row_max = __half2half2(CUDART_MIN_DENORM_FP16);
 
@@ -755,6 +776,14 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
             #pragma unroll
             for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
+                // Normalize O_frag values for online softmax
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    *reinterpret_cast<__half2 *>(
+                        &O_frag[mma_y * NumMmasOutX + mma_x][h]) *=
+                            __half2half2(norm_coefs[mat_row + h * 8]);
+                }
+
                 mma_sync_m16n8k16_f16(P_frag[mma_y], C_frag,
                                       O_frag[mma_y * NumMmasOutX + mma_x],
                                       O_frag[mma_y * NumMmasOutX + mma_x]);
@@ -777,20 +806,38 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     // 128 byte stores are still preferable than coalesced but non
     // contiguous 128 byte stores.
 
-    // Qs can be reused safely to hold O fragments
+    __half *__restrict__ Os = Qs; // Qs can be reused to hold O fragments
 
-    float *__restrict__ Os =
-        reinterpret_cast<float *>(Qs + warp_idx * NumMmasOutX * 8);
-
+    float *__restrict__ Os_warp =
+        reinterpret_cast<float *>(Os + warp_idx * NumMmasOutX * 8);
     #pragma unroll
     for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
         #pragma unroll
         for (int mma_x = 0; mma_x < NumMmasOutX; ++mma_x) {
-            stmatrix_m8n8_x2_b16(Os + mma_y * 16 * HeadDimV / 2 +
+            stmatrix_m8n8_x2_b16(Os_warp + mma_y * 16 * HeadDimV / 2 +
                                  mma_x * 8 / 2, HeadDimV / 2,
                                  O_frag[mma_y * NumMmasOutX + mma_x]);
         }
     }
+
+    __syncthreads();
+
+    constexpr int NumHeads = KernelTraits::NumHeads;
+
+    // Row sum and max are mapped to threads as
+    // shown in block_reduce_P_softmax()
+    const int coefs_row = (lane_idx % 8) / 2 + warp_idx * 8 + // ChunkSize=8
+                          (lane_idx / 16) * 4;
+    const int coefs_dst_idx = NumHeads * blockIdx.x +
+                              BlockM * blockIdx.y + coefs_row;
+    // Store row coefficients used in the combine kernel to gmem,
+    // all threads have correct values, no need to guard
+    max[coefs_dst_idx] = prev_row_max.x;
+    sum[coefs_dst_idx] = prev_row_sum.x;
+
+    // Store O to gmem, divide by the row sum in the combine kernel
+    // to avoid shuffling prev_row_sum values
+    stg_O_tile_split<KernelTraits>(Os, O + NumHeads * HeadDimV * blockIdx.x);
 }
 
 __global__ void mla_decode_combine()
