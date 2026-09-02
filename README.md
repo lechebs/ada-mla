@@ -127,7 +127,13 @@ rows to process per warp would allow be beneficial in terms of ILP, which can be
 - Loading naively with LDS each 8x8 tile for mma and using ldmatrix without any swizzling results in the same number of wavefronts, interestingly though ncu reports 128 bit access size for LDSM instructions, so perhaps not all threads are active during a LDSM instruction? The ISA requires threads 0-7 to provide the ptr to the start of rows 0-7 of the matrix, so perhaps only those threads actually access the shmem, each loading one entire row with a 128 bit access granularity. But what would be the point of ldmatrix then? Each group of 4 contiguous threads could load the corrisponding row in multicast with LDS.128, and then each thread could discard the values that it doesn't need. Perhaps x2 and x4 ldmatrix variants use respectively 16 and 32 threads, if each quarter warp is assigned to a 8x8 matrix. In that case I can see why ldmatrix would be superior, if it still maps to a single SASS instruction.
 This intuiton is confirmed by the ptx docs: "When reading 8x8 matrices, a group of four consecutive threads loads 16 bytes." So to benefit from ldmatrix, apart from swizzling, it would be better to use the x4 version." and "When .num = .x2, the elements of the second matrix are loaded in the next destination register in each thread as per the layout in above table. Similarly, when .num = .x4, elements of the third and fourth matrices are loaded in the subsequent destination registers in each thread"
 
+- I mentioned a while ago that smaller Cs tiles do not impact the AI, since the whole C has to be streamed, but they do have an effect on the AI wrt to shmem, since the Q tiles in regs can be reused for more output values, the number of iterations over C is also reduced.
+
 - Lots of IMAD instructions between HMMA, see this: https://forums.developer.nvidia.com/t/the-number-of-imad-instructions-blow-up-after-changing-to-m16n8k16-mma/351316/4
+
+- It could be interesting to see whether not using double buffering (with and without intra-tile cp.async) and having a Cs tile of double the size increases performance in the fp16 version.
+
+- What about multi-stage pipelining for Cs? In that case one could attempt pipelining the QC^T gemm with the softmax computation. Warp specialization could play a role here, since manually interleaving softmax with the next gemm could be troublesome.
 
 - Try to estimate how much peak flops can theoretically be achieved on the rtx 500 ada for the gemms in the mla computation, to have a more meaningful view on the obtained flops.
 

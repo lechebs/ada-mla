@@ -62,8 +62,8 @@ private:
 
 template<typename Traits>
 __device__ __forceinline__
-void load_Q_tile(const void *__restrict__ Q_gmem,
-                 void *__restrict__ Q_shmem)
+void ldg_Q_tile(const void *__restrict__ Q_gmem,
+                void *__restrict__ Q_shmem)
 {
     #pragma unroll
     for (int i = 0;
@@ -232,7 +232,7 @@ __device__ __forceinline__ void cp_async_wait()
  *                     8    8                             8        128
  *                  +----+----+                        +----+----+----+----+----+
  *                  |////|    |                        |////|    |    |    |    |
- *         Ct_frag  |////|    |               C_frag   |////|    |    | .. |    |
+ *         C_frag   |////|    |               C_frag   |////|    |    | .. |    |
  *                  |////|    |                        |////|    |    |    |    |
  *                  |////|    |                        |////|    |    |    |    |
  *                  +----+----+                        +----+----+----+----+----+
@@ -255,13 +255,22 @@ __device__ __forceinline__ void cp_async_wait()
  *
  */
 
+template<bool Trans = false>
 __device__ __forceinline__ void ldmatrix_sync_m8n8_x2_b16(const float *src,
                                                           float frag[2])
 {
     uint32_t *dst = reinterpret_cast<uint32_t *>(frag);
-    asm volatile ("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
-                  : "=r"(dst[0]), "=r"(dst[1])
-                  : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(src))));
+    uint32_t src_sh = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+    if constexpr (Trans) {
+        asm volatile ("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+                      : "=r"(dst[0]), "=r"(dst[1])
+                      : "r"(src_sh));
+    } else {
+        asm volatile ("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+                      : "=r"(dst[0]), "=r"(dst[1])
+                      : "r"(src_sh));
+    }
 }
 
 __device__ __forceinline__ void ldmatrix_sync_m8n8_x4_b16(const float *src,
@@ -286,7 +295,7 @@ __device__ __forceinline__ void mma_sync_m16n8k16_f16(const float A_frag[4],
     const uint32_t *B = reinterpret_cast<const uint32_t *>(B_frag);
     const uint32_t *C = reinterpret_cast<const uint32_t *>(C_frag);
     uint32_t *D = reinterpret_cast<uint32_t *>(D_frag);
-
+    // row.col is the only layout possible on sm_89
     asm volatile ("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
                   "{%0, %1}, "
                   "{%2, %3, %4, %5}, "
@@ -296,6 +305,24 @@ __device__ __forceinline__ void mma_sync_m16n8k16_f16(const float A_frag[4],
                   : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                     "r"(B[0]), "r"(B[1]),
                     "r"(C[0]), "r"(C[1]));
+}
+
+__device__ __forceinline__ void stmatrix_m8n8_x2_b16(float *dst_start,
+                                                     const int row_stride,
+                                                     const float frag[2])
+{
+    // stmatrix instruction is not available on sm_89 :(, either we shuffle
+    // and then use STS.128 or we stick to STS (32 bit)
+    const int lane_idx = threadIdx.x % WARP_SIZE;
+    // Coordinates of the fragment in each 8x8 matrix
+    const int t_x = lane_idx % 4;
+    const int t_y = lane_idx / 4;
+    // Store upper and lower 8x8 fragment halves
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        // Note that the given dst is not shifted by the row index as in ldmatrix
+        dst_start[(h * 8 + t_y) * row_stride + t_x] = frag[h];
+    }
 }
 
 template<typename KernelTraits>
@@ -326,7 +353,7 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     __half *__restrict__ Cs = shmem.alloc_tile(BlockN * HeadDimK * 2);
     __half *__restrict__ Ps = shmem.alloc_tile(BlockM * BlockN * NumWarps);
 
-    load_Q_tile<KernelTraits>(Q, Qs);
+    ldg_Q_tile<KernelTraits>(Q, Qs);
 
     __syncthreads();
 
@@ -341,6 +368,11 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     const int split_seq_length = seq_length / num_splits;
     C += blockIdx.x * split_seq_length * HeadDimK;
 
+    constexpr int NumMmasOutY = BlockM / 16;
+    constexpr int NumMmasOutX = HeadDimV / (NumWarps * 8);
+
+    float O_frag[NumMmasOutY * NumMmasOutX][2];
+
     // Loop over C tiles
     for (int C_j = 0; C_j < split_seq_length; C_j += BlockN) {
 
@@ -351,13 +383,20 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
         cp_async_commit();
 
         cp_async_wait<1>(); // Wait for Cs_ld to be ready
-        __syncwarp();
+        __syncthreads();
 
         constexpr int MmaK = KernelTraits::MmaK; // this has to match m16n8k16
         constexpr int NumSlicesPerWarp = HeadDimK / (NumWarps * MmaK);
 
         constexpr int NumMmasPerSliceX = BlockM / 16;
         constexpr int NumMmasPerSliceY = BlockN / 8;
+
+        // Coordinates of the 8x8 sub-matrices, relative to a 16x16 matrix,
+        // assigned to each thread when performing ldmatrix instructions
+        const int mat_x = (lane_idx % 16) / 8;
+        const int mat_y = lane_idx / 16;
+        // Row within the 8x8 matrix
+        const int mat_row = lane_idx % 8;
 
         // Accumulator for m16n8k16 mma has the same layout
         // as the left half of the first operand
@@ -424,11 +463,15 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
             // Each quarter warp loads one 8x8 matrix of the Q slice, and
             // each of the first two quarter warps load one 8x8 tile of the C slice
 
-            // Coordinates of the 8x8 matrices relative to the 16x16 matrix
-            const int mat_x = (lane_idx % 16) / 8;
-            const int mat_y = lane_idx / 16;
-            // Row within the 8x8 matrix
-            const int mat_row = lane_idx % 8;
+            // Explicitly staging loads before the fma loop proved to be slightly
+            // better in the fp32 version. Perhaps for a large number of mma tiles
+            // this is not ideal, but I guess ptxas would still manage to find a
+            // proper reordering. This needs consideration when attempting to
+            // pipeline shmem to regs loads, since one could try to pipeline within
+            // the same slice or across slices, provided that ptxas agrees :/.
+            // Perhaps in that case using membar.cta to force a specific ordering
+            // becomes an option, since MIO throttling is less of an issue with
+            // ldmatrix instructions.
 
             #pragma unroll
             for (int mma_y = 0; mma_y < NumMmasPerSliceY; ++mma_y) {
@@ -440,7 +483,8 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
             #pragma unroll
             for (int mma_x = 0; mma_x < NumMmasPerSliceX; ++mma_x) {
-                // We need C^t, so 32-bit loads can still be done here
+                // mma expects the second operand to be in col major,
+                // since we need C^t there's no need to transpose
                 ldmatrix_sync_m8n8_x2_b16(C_slice + (mma_x * 8 + mat_row) *
                                           HeadDimK / 2 + mat_x * 4, C_frag[0]);
             }
@@ -449,8 +493,7 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
             for (int mma_y = 0; mma_y < NumMmasPerSliceY; ++mma_y) {
                 #pragma unroll
                 for (int mma_x = 0; mma_x < NumMmasPerSliceX; ++mma_x) {
-                    mma_sync_m16n8k16_f16(Q_frag[mma_y],
-                                          C_frag[mma_x],
+                    mma_sync_m16n8k16_f16(Q_frag[mma_y], C_frag[mma_x],
                                           P_frag[mma_y * NumMmasPerSliceX + mma_x],
                                           P_frag[mma_y * NumMmasPerSliceX + mma_x]);
                 }
@@ -467,21 +510,62 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
         for (int mma_y = 0; mma_y < NumMmasPerSliceY; ++mma_y) {
             #pragma unroll
             for (int mma_x = 0; mma_x < NumMmasPerSliceX; ++mma_x) {
-                // stmatrix is not available on sm_89 :(, either we shuffle
-                // and then use STS.128 or we stick to STS (32 bit)
-
-                // Coordinates of the fragment in each 8x8 matrix
-                const int t_x = lane_idx % 4;
-                const int t_y = lane_idx / 4;
-
-                // Store upper and lower 8x8 fragment halves
-                #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    Ps_warp[(mma_y * 16 + h * 8 + t_y) * BlockN / 2 +
-                            mma_x * 8 / 2 + t_x] =
-                        P_frag[mma_y * NumMmasPerSliceX + mma_x][h];
-                }
+                stmatrix_m8n8_x2_b16(Ps_warp + mma_y * 16 * BlockN / 2 +
+                                     mma_x * 8 / 2, BlockN / 2,
+                                     P_frag[mma_y * NumMmasPerSliceX + mma_x]);
             }
+        }
+
+        __syncthreads();
+
+        // block_reduce_P_tile(Ps);
+        // online_softmax();
+
+        // Note that O_frag values have to be normalized before
+        // accumulating the PC product
+
+        { // Remove this inner scope and use a different name for P_frag
+        float P_frag[NumMmasPerSliceY][4];
+
+        // Load P_frag once, then iterate on the fragments of C and issue mmas,
+        // consider N-stage pipelining or even prefetching in bulk
+
+        #pragma unroll
+        for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
+            // We're loading a 32x16 tile into registers with two 16x16 ldmatrix
+            // instructions for Q as well, so this could be wrapped in a function
+            ldmatrix_sync_m8n8_x4_b16(reinterpret_cast<float *>(Ps) +
+                                      (mma_y * 16 + mat_y * 8 + mat_row) *
+                                      BlockN / 2 + mat_x * 8 / 2,
+                                      P_frag[mma_y]);
+        }
+
+        #pragma unroll // unroll factor may be relevant for pipelining
+        for (int mma_x = 0; mma_x < NumMmasOutX; ++mma_x) {
+            // Load C fragments, then issue corresponding mmas
+            float *__restrict__ C_frag_src =
+                reinterpret_cast<float *>(Cs_ld + warp_idx * NumMmasOutX * 8 +
+                                          mma_x * 8) +
+                    // threads 0-7 load upper half, 8-15 lower half,
+                    // each pointing to a unique row of the 16x8 16-bit matrix
+                    (mat_y * 8 + mat_row) * HeadDimK / 2;
+
+            float C_frag[2];
+            // Differently from before, we don't need C^t, so ldmatrix
+            // has to transpose the fragments to bring them in col major
+            ldmatrix_sync_m8n8_x2_b16(C_frag_src, C_frag);
+
+            // WARNING: Something may be off with the previous ldmatrix,
+            // the number of conflicts is unexpectedly low
+
+            #pragma unroll
+            for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
+                mma_sync_m16n8k16_f16(P_frag[mma_y], C_frag,
+                                      O_frag[mma_y * NumMmasOutX + mma_x],
+                                      O_frag[mma_y * NumMmasOutX + mma_x]);
+            }
+        }
+
         }
 
         // Swap Cs buffers
@@ -490,6 +574,27 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
         Cs_st = tmp;
 
         C += HeadDimK * BlockN;
+    }
+
+    // Store O_frag to shmem, then coalesced to gmem.
+    // A single mma tile row is only half a cache line sector, moreover
+    // we would be stuck with 32-bit wide gmem stores. Fully contiguous
+    // 128 byte stores are still preferable than coalesced but non
+    // contiguous 128 byte stores.
+
+    // Qs can be reused safely to hold O fragments
+
+    float *__restrict__ Os =
+        reinterpret_cast<float *>(Qs + warp_idx * NumMmasOutX * 8);
+
+    #pragma unroll
+    for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
+        #pragma unroll
+        for (int mma_x = 0; mma_x < NumMmasOutX; ++mma_x) {
+            stmatrix_m8n8_x2_b16(Os + mma_y * 16 * HeadDimV / 2 +
+                                 mma_x * 8 / 2, HeadDimV / 2,
+                                 O_frag[mma_y * NumMmasOutX + mma_x]);
+        }
     }
 }
 
