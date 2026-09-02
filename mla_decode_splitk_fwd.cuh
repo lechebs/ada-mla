@@ -10,9 +10,28 @@
 #undef __CUDA_NO_HALF_CONVERSIONS__
 #endif
 
+#ifdef __CUDA_NO_HALF2_OPERATORS__
+#undef __CUDA_NO_HALF2_OPERATORS__
+#endif
+
+#ifdef __CUDA_NO_HALF2_CONVERSIONS__
+#undef __CUDA_NO_HALF2_CONVERSIONS__
+#endif
+
 #include <cstdint>
 
 #include <cuda_fp16.h>
+
+#ifdef CUDART_ZERO_FP16
+#undef CUDART_ZERO_FP16
+#endif
+
+#ifdef CUDART_MIN_DENORM_FP16
+#undef CUDART_MIN_DENORM_FP16
+#endif
+
+#define CUDART_ZERO_FP16 __ushort_as_half((unsigned short)0x0000U)
+#define CUDART_MIN_DENORM_FP16 __ushort_as_half((unsigned short)0x0001U)
 
 #define WARP_SIZE 32
 
@@ -236,7 +255,7 @@ __device__ __forceinline__ void cp_async_wait()
  *                  |////|    |                        |////|    |    |    |    |
  *                  |////|    |                        |////|    |    |    |    |
  *                  +----+----+                        +----+----+----+----+----+
- *       Q_frag                               16
+ *       Q_frag                              16
  *    +---------+   +----+----+          +---------+   +----+----+----+----+----+
  *    |/////////|   |////|    |          |/////////|   |////|    |    |    |    |
  * 16 |/////////|   |mma0|mma1|          |/////////|   |mma0|mma2|mma4| .. | mma|
@@ -248,7 +267,7 @@ __device__ __forceinline__ void cp_async_wait()
  *    |         |   |    |    |          |         |   |    |    |    |    | 32 |
  *    |         |   |    |    |          |         |   |    |    |    |    |    |
  *    +---------+   +----+----+          +---------+   +----+----+----+----+----+
- *        16            Pr                   Ps                   Or
+ *        16          P_frag               P_frag                O_frag
  *
  *    each warp issues 4 m16n8k16 mma instructions per QC^t slice (36 mmas)
  *    and 32 m16n8k16 mma instructions for PC.
@@ -325,6 +344,179 @@ __device__ __forceinline__ void stmatrix_m8n8_x2_b16(float *dst_start,
     }
 }
 
+template<typename Traits>
+__device__ __forceinline__
+void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
+                            typename Traits::Scalar *norm_shmem,
+                            __half2 &prev_row_sum,
+                            __half2 &prev_row_max)
+{
+    // Slices are stored one after the other in shmem
+
+    /*
+     *  Each warp reduces a tile from each P slice
+     *
+     *      slice0        slice1             slice3
+     *   +---------+   +---------+        +---------+
+     *   |//warp0//| + |//warp0//| + .. + |//warp0//| 
+     *   +---------+   +---------+        +---------+
+     *   |  warp1  | + |  warp1  | + .. + |  warp1  |
+     *   +---------+   +---------+        +---------+
+     *   |  warp2  | + |  warp2  | + .. + |  warp2  |
+     *   +---------+   +---------+        +---------+
+     * 8 |  warp3  | + |  warp3  | + .. + |  warp3  |
+     *   +---------+   +---------+        +---------+
+     *       16
+     *
+     *  Warp reduction across slices tiles is done in batches of
+     *  8 contiguous 16-bit values (16 bytes), using warp shuffles
+     *
+     *             slice0                       slice1                          slice3
+     *   +-----------------------+    +-----------------------+       +-----------------------+
+     *   |////t00////|    t01    |    |////t08////|    t09    |       |////t24////|    t25    |
+     *   |    t02    |    t03    |    |    t10    |    t11    |       |    t26    |    t27    |
+     *   |    t04    |    t05    |    |    t12    |    t13    |       |    t28    |    t29    |
+     *   |    t06    |    t07    |    |    t14    |    t15    |       |    t30    |    t31    |
+     * 8 +-----------+-----------+    +-----------------------+  ...  +-----------------------+
+     *   |    t00    |    t01    |    |    t08    |    t09    |       |    t24    |    t25    |
+     *   |    t02    |    t03    |    |    t10    |    t11    |       |    t26    |    t27    |
+     *   |    t04    |    t05    |    |    t12    |    t13    |       |    t28    |    t29    |
+     *   |    t06    |    t07    |    |    t14    |    t15    |       |    t30    |    t31    |
+     *   +-----------+-----------+    +-----------------------+       +-----------------------+
+     *         8
+     */
+
+    // Bank conflicts are avoided within each quarter warp, threads mapping
+    // may need to be revisited in case of shmem swizzling
+
+    constexpr int WarpTileHeight = Traits::BlockM / Traits::NumWarps;
+    constexpr int NumSlices = Traits::NumWarps;
+    constexpr int SliceWidth = Traits::BlockN;
+    constexpr int SliceHeight = Traits::BlockM;
+
+    // Could be computed based on P size, but that would change
+    // the reduction logic, so we keep it hardcoded for now
+    constexpr int NumChunksPerWarp = 2; 
+    constexpr int ChunkHeight = WarpTileHeight / NumChunksPerWarp;
+
+    const int lane_idx = threadIdx.x % WARP_SIZE;
+    const int slice_offset = (lane_idx / 8) * SliceHeight * SliceWidth;
+
+    const int x_in_chunk = (lane_idx % 8) % 2;
+    const int y_in_chunk = (lane_idx % 8) / 2;
+
+    // __half2 intrinsics map to one SASS instruction
+    __half2 P_batch[NumChunksPerWarp][4];
+
+    #pragma unroll
+    for (int chunk = 0; chunk < NumChunksPerWarp; ++chunk) {
+        // Not sure whether restrict here is relevant
+        float4 *__restrict__ P_chunk =
+            reinterpret_cast<float4 *>(P_shmem + slice_offset +
+                                       (chunk * ChunkHeight + y_in_chunk) *
+                                       SliceWidth);
+        float4 P_word = P_chunk[x_in_chunk];
+
+        #pragma unroll
+        for (int h = 0; h < 4; ++h) {
+            // Extract 32 bit values from 16 byte word
+            P_batch[chunk][h] = reinterpret_cast<__half2 *>(&P_word)[h];
+            // butterfly shuffle to give each thread get the reduced values
+            P_batch[chunk][h] += __shfl_xor_sync(0xffffffff,
+                                                 P_batch[chunk][h], 8);
+            P_batch[chunk][h] += __shfl_xor_sync(0xffffffff,
+                                                 P_batch[chunk][h], 16);
+            // QC^t product coefficient
+            constexpr int HeadDim = 128;
+            constexpr int HeadDimRope = 64;
+            P_batch[chunk][h] *=
+                __half2half2(__float2half(__frsqrt_rn(HeadDim + HeadDimRope)));
+        }
+    }
+
+    // Reduced values are immediately used to perform row-wise softmax
+
+    /*
+     *  Each thread now handles either the upper or lower half of
+     *  one of the two 16 byte word that it was responsible for
+     *  during the warp reduction
+     *
+     *      4
+     *   +-----------------------+
+     *   | t00 | t08 | t01 | t09 |
+     *   | t02 | t10 | t03 | t11 |
+     *   | t04 | t12 | t05 | t13 |
+     *   | t06 | t14 | t07 | t15 |
+     * 8 +-----------+-----------+
+     *   | t16 | t24 | t17 | t25 |
+     *   | t18 | t26 | t19 | t27 |
+     *   | t20 | t28 | t21 | t29 |
+     *   | t22 | t30 | t23 | t31 |
+     *   +-----------+-----------+
+     *         8
+     *
+     *  Note that threads mapped to contiguous 16 byte words
+     *  (e.g t00 and t08) do not need to xor shuffle their
+     *  initial values, they were part of the same batch
+     *
+     *  t00 shuffles with t01 and t08 shuffles with 09,
+     *  then t00 shuffles with t08 and t01 with t01
+     *
+     */
+
+    const int chunk = lane_idx / 16;
+    const int has_upp = (lane_idx % 16) / 8;
+
+    // Note that the usage of __half2 for max and sum
+    // is to emit vectorized half2 ops, eventually
+    // they will hold the same __half values
+
+    // WARNING: P_batch gets spilled to lmem in this way!
+
+    // Reduce within thread assigned __half2 values
+    __half2 row_max = __hmax2(P_batch[chunk][has_upp * 2],
+                              P_batch[chunk][has_upp * 2 + 1]);
+    // Reduce across __half2 values on the same row
+    row_max = __hmax2(row_max, __shfl_xor_sync(0xffffffff, row_max, 1));
+    row_max = __hmax2(row_max, __shfl_xor_sync(0xffffffff, row_max, 8));
+    // Reduce within __half2 value
+    row_max.x = __hmax(row_max.x, row_max.y);
+
+    row_max.x = __hmax(prev_row_max.x, row_max.x); // Update running max
+    row_max.y = row_max.x;
+
+    __half2 row_sum = __half2half2(CUDART_ZERO_FP16);
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        P_batch[chunk][has_upp * 2 + h] =
+            h2exp(P_batch[chunk][has_upp * 2 + h] - row_max);
+        // Reduce within thread
+        row_sum += P_batch[chunk][has_upp * 2 + h];
+    }
+    // Reduce across __half2 values on the same row
+    row_sum += __shfl_xor_sync(0xffffffff, row_sum, 1);
+    row_sum += __shfl_xor_sync(0xffffffff, row_sum, 8);
+    // Reduce within __half2 value
+    row_sum.x += row_sum.y;
+    row_sum.x = row_sum.y;
+
+    __half2 row_norm_coef = h2exp(prev_row_max - row_max);
+    row_sum += prev_row_sum * row_norm_coef;
+
+    prev_row_max = row_max;
+    prev_row_sum = row_sum;
+
+    // Store norm coefs to shmem, all threads have the
+    // correct value, this is redundant but safe
+    norm_shmem[chunk * ChunkHeight + y_in_chunk] = row_norm_coef.x;
+
+    // Store logits to shmem, we can use STS.64
+    reinterpret_cast<float2 *>(
+        P_shmem + (y_in_chunk + chunk * ChunkHeight) * SliceWidth)[
+            (lane_idx % 2) * 2 + (lane_idx % 8) / 8] =
+        *reinterpret_cast<float2 *>(&P_batch[chunk][has_upp * 2]);
+}
+
 template<typename KernelTraits>
 __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
                                            const __half *__restrict__ C,
@@ -348,7 +540,8 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     SharedMemory<__half> shmem;
 
     // TODO: There's no need to declare these as __half,
-    // consider using float pointers for all buffers
+    // consider using float pointers for all buffers, but
+    // what about aliasing rules?
     __half *__restrict__ Qs = shmem.alloc_tile(BlockM * HeadDimK);
     __half *__restrict__ Cs = shmem.alloc_tile(BlockN * HeadDimK * 2);
     __half *__restrict__ Ps = shmem.alloc_tile(BlockM * BlockN * NumWarps);
@@ -372,6 +565,9 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     constexpr int NumMmasOutX = HeadDimV / (NumWarps * 8);
 
     float O_frag[NumMmasOutY * NumMmasOutX][2];
+
+    __half2 prev_row_sum = __half2half2(CUDART_ZERO_FP16);
+    __half2 prev_row_max = __half2half2(CUDART_MIN_DENORM_FP16);
 
     // Loop over C tiles
     for (int C_j = 0; C_j < split_seq_length; C_j += BlockN) {
@@ -500,16 +696,14 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
             }
         }
 
-        // Block reduce the accumulated slices
-
+        // Store the accumulated slices to shmem
         float *__restrict__ Ps_warp =
             reinterpret_cast<float *>(Ps + warp_idx * BlockM * BlockN);
-
-        // Store P_frag to shmem
         #pragma unroll
         for (int mma_y = 0; mma_y < NumMmasPerSliceY; ++mma_y) {
             #pragma unroll
             for (int mma_x = 0; mma_x < NumMmasPerSliceX; ++mma_x) {
+                // Store P_frag to shmem
                 stmatrix_m8n8_x2_b16(Ps_warp + mma_y * 16 * BlockN / 2 +
                                      mma_x * 8 / 2, BlockN / 2,
                                      P_frag[mma_y * NumMmasPerSliceX + mma_x]);
@@ -518,10 +712,14 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
         __syncthreads();
 
-        // block_reduce_P_tile(Ps);
-        // online_softmax();
+        __shared__ __half norm_coefs[BlockM];
 
-        // Note that O_frag values have to be normalized before
+        block_reduce_P_softmax<KernelTraits>(
+            Ps, norm_coefs, prev_row_sum, prev_row_max);
+
+        __syncthreads();
+
+        // TODO: Note that O_frag values have to be normalized before
         // accumulating the PC product
 
         { // Remove this inner scope and use a different name for P_frag
@@ -554,9 +752,6 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
             // Differently from before, we don't need C^t, so ldmatrix
             // has to transpose the fragments to bring them in col major
             ldmatrix_sync_m8n8_x2_b16(C_frag_src, C_frag);
-
-            // WARNING: Something may be off with the previous ldmatrix,
-            // the number of conflicts is unexpectedly low
 
             #pragma unroll
             for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
