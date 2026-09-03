@@ -30,7 +30,6 @@
 #undef CUDART_MIN_DENORM_FP16
 #endif
 
-#define CUDART_ZERO_FP16 __ushort_as_half((unsigned short)0x0000U)
 #define CUDART_MIN_DENORM_FP16 __ushort_as_half((unsigned short)0x0001U)
 
 #define WARP_SIZE 32
@@ -277,6 +276,7 @@ __device__ __forceinline__ void cp_async_wait()
 
 template<bool Trans = false>
 __device__ __forceinline__ void ldmatrix_sync_m8n8_x2_b16(const float *src,
+                                                          // fp16 fragments
                                                           float frag[2])
 {
     uint32_t *dst = reinterpret_cast<uint32_t *>(frag);
@@ -294,6 +294,7 @@ __device__ __forceinline__ void ldmatrix_sync_m8n8_x2_b16(const float *src,
 }
 
 __device__ __forceinline__ void ldmatrix_sync_m8n8_x4_b16(const float *src,
+                                                          // fp16 fragments
                                                           float frag[4])
 {
     uint32_t *dst = reinterpret_cast<uint32_t *>(frag);
@@ -306,30 +307,32 @@ __device__ __forceinline__ void ldmatrix_sync_m8n8_x4_b16(const float *src,
 
 __device__ __forceinline__ void mma_sync_m16n8k16_f16(const float A_frag[4],
                                                       const float B_frag[2],
-                                                      const float C_frag[2],
-                                                      float D_frag[2])
+                                                      // fp32 accumulators
+                                                      const float C_frag[4],
+                                                      float D_frag[4])
 {
     // General purpose 32-bit registers are used as constraint
     // specifier for .f16x2 registers, so we need to cast them
     const uint32_t *A = reinterpret_cast<const uint32_t *>(A_frag);
     const uint32_t *B = reinterpret_cast<const uint32_t *>(B_frag);
-    const uint32_t *C = reinterpret_cast<const uint32_t *>(C_frag);
-    uint32_t *D = reinterpret_cast<uint32_t *>(D_frag);
     // row.col is the only layout possible on sm_89
-    asm volatile ("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-                  "{%0, %1}, "
-                  "{%2, %3, %4, %5}, "
-                  "{%6, %7}, "
-                  "{%8, %9};"
-                  : "=r"(D[0]), "=r"(D[1]) // dst
+    asm volatile ("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                  "{%0, %1, %2, %3}, "
+                  "{%4, %5, %6, %7}, "
+                  "{%8, %9}, "
+                  "{%10, %11, %12, %13};"
+                  : "=f"(D_frag[0]), "=f"(D_frag[1]),
+                    "=f"(D_frag[2]), "=f"(D_frag[3])
                   : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                     "r"(B[0]), "r"(B[1]),
-                    "r"(C[0]), "r"(C[1]));
+                    "f"(C_frag[0]), "f"(C_frag[1]),
+                    "f"(C_frag[2]), "f"(C_frag[3]));
 }
 
-__device__ __forceinline__ void stmatrix_m8n8_x2_b16(float *dst_start,
+__device__ __forceinline__ void stmatrix_m8n8_x2_f2h(float *dst_start,
                                                      const int row_stride,
-                                                     const float frag[2])
+                                                     // fp32 fragments
+                                                     const float frag[4])
 {
     // stmatrix instruction is not available on sm_89 :(, either we shuffle
     // and then use STS.128 or we stick to STS (32 bit)
@@ -340,8 +343,12 @@ __device__ __forceinline__ void stmatrix_m8n8_x2_b16(float *dst_start,
     // Store upper and lower 8x8 fragment halves
     #pragma unroll
     for (int h = 0; h < 2; ++h) {
+        // Convert to fp16 before storing
+        __half2 pack = make_half2(__float2half(frag[2 * h]),
+                                  __float2half(frag[2 * h + 1]));
         // Note that the given dst is not shifted by the row index as in ldmatrix
-        dst_start[(h * 8 + t_y) * row_stride + t_x] = frag[h];
+        dst_start[(h * 8 + t_y) * row_stride + t_x] =
+            *reinterpret_cast<float *>(&pack);
     }
 }
 
@@ -400,10 +407,13 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
     constexpr int ChunkHeight = WarpTileHeight / NumChunksPerWarp;
 
     const int lane_idx = threadIdx.x % WARP_SIZE;
+    const int warp_idx = threadIdx.x / WARP_SIZE;
     const int slice_offset = (lane_idx / 8) * SliceHeight * SliceWidth;
 
     const int x_in_chunk = (lane_idx % 8) % 2;
     const int y_in_chunk = (lane_idx % 8) / 2;
+
+    // TODO: Reduction could be done in fp32, both across slices and within rows
 
     // __half2 intrinsics map to one SASS instruction
     __half2 P_batch[NumChunksPerWarp][4];
@@ -411,11 +421,10 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
     #pragma unroll
     for (int chunk = 0; chunk < NumChunksPerWarp; ++chunk) {
         // Not sure whether restrict here is relevant
-        float4 *__restrict__ P_chunk =
+        float4 P_word =
             reinterpret_cast<float4 *>(P_shmem + slice_offset +
-                                       (chunk * ChunkHeight + y_in_chunk) *
-                                       SliceWidth);
-        float4 P_word = P_chunk[x_in_chunk];
+                (warp_idx * WarpTileHeight + chunk * ChunkHeight +
+                 y_in_chunk) * SliceWidth)[x_in_chunk];
 
         #pragma unroll
         for (int h = 0; h < 4; ++h) {
@@ -430,6 +439,7 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
             constexpr int HeadDim = 128;
             constexpr int HeadDimRope = 64;
             P_batch[chunk][h] *=
+                // Fast invsqrt has a non negligible impact on relative error
                 __half2half2(__float2half(__frsqrt_rn(HeadDim + HeadDimRope)));
         }
     }
@@ -472,6 +482,7 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
     // they will hold the same __half values
 
     // WARNING: P_batch gets spilled to lmem in this way!
+    // Reduce reduction granularity to avoid the problem
 
     // Reduce within thread assigned __half2 values
     __half2 row_max = __hmax2(P_batch[chunk][has_upp * 2],
@@ -485,7 +496,7 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
     row_max.x = __hmax(prev_row_max.x, row_max.x); // Update running max
     row_max.y = row_max.x;
 
-    __half2 row_sum = __half2half2(CUDART_ZERO_FP16);
+    __half2 row_sum = __half2half2(__float2half(0));
     #pragma unroll
     for (int h = 0; h < 2; ++h) {
         P_batch[chunk][has_upp * 2 + h] =
@@ -498,7 +509,7 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
     row_sum += __shfl_xor_sync(0xffffffff, row_sum, 8);
     // Reduce within __half2 value
     row_sum.x += row_sum.y;
-    row_sum.x = row_sum.y;
+    row_sum.y = row_sum.x;
 
     __half2 row_norm_coef = h2exp(prev_row_max - row_max);
     row_sum += prev_row_sum * row_norm_coef;
@@ -508,12 +519,14 @@ void block_reduce_P_softmax(typename Traits::Scalar *P_shmem,
 
     // Store norm coefs to shmem, all threads have the
     // correct value, this is redundant but safe
-    norm_shmem[chunk * ChunkHeight + y_in_chunk] = row_norm_coef.x;
+    norm_shmem[warp_idx * WarpTileHeight +
+               chunk * ChunkHeight + y_in_chunk] = row_norm_coef.x;
 
     // Store logits to shmem, we can use STS.64
-    reinterpret_cast<float2 *>(
-        P_shmem + (y_in_chunk + chunk * ChunkHeight) * SliceWidth)[
-            (lane_idx % 2) * 2 + (lane_idx % 8) / 8] =
+    reinterpret_cast<float2 *>( // this is horrible :/
+        P_shmem + (y_in_chunk + chunk * ChunkHeight +
+                   warp_idx * WarpTileHeight) * SliceWidth)[
+            (lane_idx % 2) * 2 + has_upp] =
         *reinterpret_cast<float2 *>(&P_batch[chunk][has_upp * 2]);
 }
 
@@ -573,21 +586,28 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     __half *__restrict__ Cs_ld = Cs;
     __half *__restrict__ Cs_st = Cs + BlockN * HeadDimK;
 
+    const int split_seq_length = seq_length / num_splits;
+    C += blockIdx.x * split_seq_length * HeadDimK;
+
     // Prefetch first C tile
     cp_async_ldgsts_C_tile<KernelTraits>(C, Cs_ld);
     cp_async_commit();
 
-    const int split_seq_length = seq_length / num_splits;
-    C += blockIdx.x * split_seq_length * HeadDimK;
-
     constexpr int NumMmasOutY = BlockM / 16;
     constexpr int NumMmasOutX = HeadDimV / (NumWarps * 8);
 
-    float O_frag[NumMmasOutY * NumMmasOutX][2];
+    float O_frag[NumMmasOutY * NumMmasOutX][4]; // fp32 accumulator
+    #pragma unroll
+    for (int mma = 0; mma < NumMmasOutY * NumMmasOutX; ++mma) {
+        #pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            O_frag[mma][f] = 0;
+        }
+    }
 
     // block_reduce_P_softmax() specifies the thread to row
     // mapping for these values
-    __half2 prev_row_sum = __half2half2(CUDART_ZERO_FP16);
+    __half2 prev_row_sum = __half2half2(__float2half(0));
     __half2 prev_row_max = __half2half2(CUDART_MIN_DENORM_FP16);
 
     // Loop over C tiles
@@ -605,8 +625,8 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
         constexpr int MmaK = KernelTraits::MmaK; // this has to match m16n8k16
         constexpr int NumSlicesPerWarp = HeadDimK / (NumWarps * MmaK);
 
-        constexpr int NumMmasPerSliceX = BlockM / 16;
-        constexpr int NumMmasPerSliceY = BlockN / 8;
+        constexpr int NumMmasPerSliceX = BlockN / 8;
+        constexpr int NumMmasPerSliceY = BlockM / 16;
 
         // Coordinates of the 8x8 sub-matrices, relative to a 16x16 matrix,
         // assigned to each thread when performing ldmatrix instructions
@@ -617,7 +637,14 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
         // Accumulator for m16n8k16 mma has the same layout
         // as the left half of the first operand
-        float P_frag[NumMmasPerSliceX * NumMmasPerSliceY][2];
+        float P_frag[NumMmasPerSliceX * NumMmasPerSliceY][4]; // fp32 accumulator
+        #pragma unroll
+        for (int mma = 0; mma < NumMmasPerSliceX * NumMmasPerSliceY; ++mma) {
+            #pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                P_frag[mma][f] = 0.0;
+            }
+        }
 
         // Loop over the QC^t slices
         #pragma unroll
@@ -669,6 +696,7 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
             // Note that LDS.128 can't be used without shuffling since threads do
             // not own contiguous 16 bytes. That's probably why ldmatrix exists.
 
+            // Operands are in fp16 but declared as float variables
             float Q_frag[NumMmasPerSliceY][4]; // {a0, a1}, {a2, a3}, {a4, a5}, {a6, a7}
             float C_frag[NumMmasPerSliceX][2]; // {b0, b1}, {b2, b3}
 
@@ -703,7 +731,7 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
                 // mma expects the second operand to be in col major,
                 // since we need C^t there's no need to transpose
                 ldmatrix_sync_m8n8_x2_b16(C_slice + (mma_x * 8 + mat_row) *
-                                          HeadDimK / 2 + mat_x * 4, C_frag[0]);
+                                          HeadDimK / 2 + mat_x * 4, C_frag[mma_x]);
             }
 
             #pragma unroll
@@ -724,8 +752,8 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
         for (int mma_y = 0; mma_y < NumMmasPerSliceY; ++mma_y) {
             #pragma unroll
             for (int mma_x = 0; mma_x < NumMmasPerSliceX; ++mma_x) {
-                // Store P_frag to shmem
-                stmatrix_m8n8_x2_b16(Ps_warp + mma_y * 16 * BlockN / 2 +
+                // Store P_frag to shmem, converting to fp16
+                stmatrix_m8n8_x2_f2h(Ps_warp + mma_y * 16 * BlockN / 2 +
                                      mma_x * 8 / 2, BlockN / 2,
                                      P_frag[mma_y * NumMmasPerSliceX + mma_x]);
             }
@@ -740,11 +768,8 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
         __syncthreads();
 
-        // TODO: Note that O_frag values have to be normalized before
-        // accumulating the PC product
-
         { // Remove this inner scope and use a different name for P_frag
-        float P_frag[NumMmasPerSliceY][4];
+        float P_frag[NumMmasOutY][4]; // fp16 operand
 
         // Load P_frag once, then iterate on the fragments of C and issue mmas,
         // consider N-stage pipelining or even prefetching in bulk
@@ -767,21 +792,23 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
                                           mma_x * 8) +
                     // threads 0-7 load upper half, 8-15 lower half,
                     // each pointing to a unique row of the 16x8 16-bit matrix
-                    (mat_y * 8 + mat_row) * HeadDimK / 2;
+                    (mat_x * 8 + mat_row) * HeadDimK / 2;
 
-            float C_frag[2];
+            float C_frag[2]; // fp16 operand
+
             // Differently from before, we don't need C^t, so ldmatrix
             // has to transpose the fragments to bring them in col major
-            ldmatrix_sync_m8n8_x2_b16(C_frag_src, C_frag);
+            ldmatrix_sync_m8n8_x2_b16<true>(C_frag_src, C_frag);
 
             #pragma unroll
             for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
                 // Normalize O_frag values for online softmax
                 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    *reinterpret_cast<__half2 *>(
-                        &O_frag[mma_y * NumMmasOutX + mma_x][h]) *=
-                            __half2half2(norm_coefs[mat_row + h * 8]);
+                    float coef = __half2float(
+                        norm_coefs[mma_y * 16 + lane_idx / 4 + h * 8]);
+                    O_frag[mma_y * NumMmasOutX + mma_x][2 * h + 0] *= coef;
+                    O_frag[mma_y * NumMmasOutX + mma_x][2 * h + 1] *= coef;
                 }
 
                 mma_sync_m16n8k16_f16(P_frag[mma_y], C_frag,
@@ -814,7 +841,7 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
         #pragma unroll
         for (int mma_x = 0; mma_x < NumMmasOutX; ++mma_x) {
-            stmatrix_m8n8_x2_b16(Os_warp + mma_y * 16 * HeadDimV / 2 +
+            stmatrix_m8n8_x2_f2h(Os_warp + mma_y * 16 * HeadDimV / 2 +
                                  mma_x * 8 / 2, HeadDimV / 2,
                                  O_frag[mma_y * NumMmasOutX + mma_x]);
         }
@@ -826,7 +853,7 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
     // Row sum and max are mapped to threads as
     // shown in block_reduce_P_softmax()
-    const int coefs_row = (lane_idx % 8) / 2 + warp_idx * 8 + // ChunkSize=8
+    const int coefs_row = (lane_idx % 8) / 2 + warp_idx * 8 + // WarpTileHeight=8
                           (lane_idx / 16) * 4;
     const int coefs_dst_idx = NumHeads * blockIdx.x +
                               BlockM * blockIdx.y + coefs_row;
@@ -840,9 +867,51 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
     stg_O_tile_split<KernelTraits>(Os, O + NumHeads * HeadDimV * blockIdx.x);
 }
 
-__global__ void mla_decode_combine()
+template<typename KernelTraits>
+__global__ void mla_decode_combine(const __half *__restrict__ O_splits,
+                                   const __half *__restrict__ row_max_splits,
+                                   const __half *__restrict__ row_sum_splits,
+                                   __half *O,
+                                   const int num_splits)
 {
+    constexpr int NumHeads = KernelTraits::NumHeads;
+    constexpr int HeadDimV = KernelTraits::HeadDimV;
 
+    // This kernel is fairly naive, but shouldn't be a bottleneck,
+    // consider letting num_splits be a compile time constant
+    // use shared memory for row coefficients and vectorized loads
+
+    // Each block is responsible for a single row of the output
+    const int row = blockIdx.x;
+
+    // Reduce splits row coefficients, we can get away with a naive local
+    // reduction for a small number of splits
+
+    // Online softmax correction is being applied to whole splits here
+
+    __half row_max = CUDART_MIN_DENORM_FP16;
+    for (int n = 0; n < num_splits; ++n) {
+        row_max = __hmax(row_max, row_max_splits[n * NumHeads + row]);
+    }
+
+    float row_sum = 0;;
+    for (int n = 0; n < num_splits; ++n) {
+        row_sum += __half2float(row_sum_splits[n * NumHeads + row]) *
+                   expf(__half2float(row_max_splits[n * NumHeads + row] - row_max));
+    }
+
+    float row_sum_inv = 1 / row_sum;
+
+    for (int j = 0; j < HeadDimV; j += blockDim.x) {
+        float O_tmp = 0;
+        for (int n = 0; n < num_splits; ++n) {
+            __half n_row_max = row_max_splits[n * NumHeads + row];
+            O_tmp += __half2float(O_splits[n * NumHeads * HeadDimV +
+                                  row * HeadDimV + j + threadIdx.x]) *
+                     expf(__half2float(n_row_max - row_max));
+        }
+        O[row * HeadDimV + j + threadIdx.x] = __float2half(O_tmp * row_sum_inv);
+    }
 }
 
 void run_mla_decode_splitk_fp16(const __half *query,
@@ -858,7 +927,7 @@ void run_mla_decode_splitk_fp16(const __half *query,
     using Traits = KernelTraits<__half>;
 
     dim3 block(Traits::NumThreads, 1);
-    dim3 grid(num_splits, (num_heads - 1) / Traits::BlockM + 1);
+    dim3 grid(num_splits, num_heads / Traits::BlockM);
 
     int shmem_bytes = (Traits::BlockM * Traits::HeadDimK +
                        Traits::BlockN * Traits::HeadDimK  * 2 +
@@ -881,7 +950,8 @@ void run_mla_decode_splitk_fp16(const __half *query,
         query, cache, splits_out, splits_max, splits_sum,
         seq_length, num_splits);
 
-    //mla_decode_combine<>
+    mla_decode_combine<Traits><<<Traits::NumHeads, 128>>>(
+        splits_out, splits_max, splits_sum, out, num_splits);
 
     if ((error = cudaGetLastError()) != cudaSuccess) {
         printf("Error: %s (%s)\n",

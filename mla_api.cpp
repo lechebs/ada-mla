@@ -88,6 +88,8 @@ at::Tensor mla_decode_split(const at::Tensor &query,
 {
     // todo: refactor common logic with mla_decode_naive
 
+    // Check that cache.size(1) is multiple of BlockN
+
     at::TensorOptions options =
         at::TensorOptions().device(query.device()).dtype(query.scalar_type());
     at::Tensor out = at::empty({ query.size(0), query.size(1) - 64 }, options);

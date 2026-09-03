@@ -33,13 +33,14 @@ mla_decode_split = module.mla_decode_split
 
 # torch.set_float32_matmul_precision("high") # to use tensor cores for fp32
 
+torch.manual_seed(42)
+
 def mla_decode_torch(q: torch.Tensor,
                      c: torch.Tensor,
                      head_dim_k: int=HEAD_DIM_K,
                      head_dim_v: int=HEAD_DIM_V) -> torch.Tensor:
-
     return torch.softmax(
-        q @ c.T / head_dim_k ** 0.5, dim=-1) @ c[:, :head_dim_v]
+        q @ c.T / ((NUM_HEADS + 64) ** 0.5), dim=-1) @ c[:, :head_dim_v]
 
 def mla_decode_sdpa(q: torch.Tensor,
                     c: torch.Tensor,
@@ -51,7 +52,8 @@ def mla_decode_sdpa(q: torch.Tensor,
         return scaled_dot_product_attention(
             q[None, None, :, :],
             c[None, None, :, :],
-            c[None, None, :, :head_dim_v])
+            c[None, None, :, :head_dim_v],
+            scale=1.0 / ((NUM_HEADS + 64) ** 0.5))
 
 MLA_DECODE_FUNCS = {
     "torch": mla_decode_torch,
@@ -107,8 +109,9 @@ def run_test(mla_funcs: list[callable],
         for func in mla_funcs:
             diff = torch.abs(func(q, c) - out_ref)
             max_err, mean_err = torch.max(diff), torch.mean(diff)
+            rel_mean_err = mean_err / torch.mean(torch.abs(out_ref))
             print(f"[{func.__name__}] seq_len={seq_len} max={max_err:.6g}"
-                  f" mean={mean_err:.6g}")
+                  f" mean={mean_err:.6g} rel={rel_mean_err:.6f}")
 
 def run_benchmark(mla_funcs: list[callable],
                   num_heads: int,
