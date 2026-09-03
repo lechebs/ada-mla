@@ -225,16 +225,22 @@ __device__ __forceinline__
 void ldg_Q_tile(const void *__restrict__ Q_gmem,
                 void *__restrict__ Q_shmem)
 {
+    constexpr int NumWordsPerRow = Traits::HeadDimK / Traits::VecLen;
+
     #pragma unroll
-    for (int i = 0;
-             i < Traits::BlockM * Traits::HeadDimK / Traits::VecLen;
-             i += Traits::NumThreads)
+    for (uint32_t j = 0; j < Traits::BlockM * NumWordsPerRow;
+                         j += Traits::NumThreads)
     {
-        const int idx = i + threadIdx.x;
-        reinterpret_cast<float4 *>(Q_shmem)[idx] =
+        // 16-byte target word coordinates
+        const int x = ((j + threadIdx.x) % NumWordsPerRow) % 8;
+        const int y = ((j + threadIdx.x) / NumWordsPerRow) % 8;
+        // xor the coordinates to get swizzled x pos
+        const uint32_t swz_x = x ^ y;
+        // One could achieve the same by xoring specific upper
+        // and lower bits of the source address
+        reinterpret_cast<float4 *>(Q_shmem)[((j + threadIdx.x) & ~7) + swz_x] =
             reinterpret_cast<const float4 *>(Q_gmem)[
-                (Traits::BlockM * blockIdx.y) * Traits::HeadDimK /
-                Traits::VecLen + idx];
+                (Traits::BlockM * blockIdx.y) * NumWordsPerRow + j + threadIdx.x];
     }
 }
 
@@ -244,19 +250,20 @@ void cp_async_ldgsts_C_tile(const typename Traits::Scalar *__restrict__ C_gmem_s
                             typename Traits::Scalar *__restrict__ C_shmem_dst)
 {
     constexpr int VecLen = Traits::VecLen;
-    constexpr int HeadDimK = Traits::HeadDimK;
+    constexpr int NumWordsPerRow = Traits::HeadDimK / VecLen;
 
     #pragma unroll
-    for (int j = 0;
-             j < Traits::BlockN * HeadDimK / VecLen;
-             j += Traits::NumThreads) {
+    for (int j = 0; j < Traits::BlockN * NumWordsPerRow;
+                    j += Traits::NumThreads) {
 
-        const int idx = j + threadIdx.x;
+        const int x = ((j + threadIdx.x) % NumWordsPerRow) % 8;
+        const int y = ((j + threadIdx.x) / NumWordsPerRow) % 8;
+        const uint32_t swz_x = x ^ y;
 
-        const typename Traits::Scalar *src = C_gmem_src + VecLen * idx;
+        const typename Traits::Scalar *src = C_gmem_src + VecLen * (j + threadIdx.x);
         // Convert generic pointer to shared space state
         const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(
-            C_shmem_dst + VecLen * idx));
+            C_shmem_dst + 8 * (((j + threadIdx.x) & ~7u) + swz_x)));
 
         asm volatile ("cp.async.cg.shared.global [%0], [%1], 16;"
                       :: "r"(dst), "l"(src));
@@ -718,20 +725,33 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
             // becomes an option, since MIO throttling is less of an issue with
             // ldmatrix instructions.
 
+            const uint32_t chunk_start = slice_offset & ~63u;
+            const uint32_t swizzled_x = mat_row ^ (((slice_offset + mat_x * 8) & 63u) / 8);
+
             #pragma unroll
             for (int mma_y = 0; mma_y < NumMmasPerSliceY; ++mma_y) {
+                // To avoid bank conflicts when loading each 8x8 matrix, swizzle
+                // 16 byte words within 8x64 16-bit chunks of Qs, which precisely
+                // span all 32 shmem banks
+                const float *Q_src =
+                    reinterpret_cast<float *>(Qs + chunk_start + swizzled_x * 8);
+
                 // Each thread provides the ptr to one row of the 4 8x8 16 bit matrices
                 ldmatrix_sync_m8n8_x4_b16(
-                    Q_slice + (mma_y * 16 + mat_y * 8 + mat_row) *
-                    HeadDimK / 2 + mat_x * 4, Q_frag[mma_y]);
+                    Q_src + (mma_y * 16 + mat_y * 8 + mat_row) *
+                    HeadDimK / 2, Q_frag[mma_y]);
             }
 
             #pragma unroll
             for (int mma_x = 0; mma_x < NumMmasPerSliceX; ++mma_x) {
+                // Swizzling in the same manner here yields 2 wavefronts,
+                // since only two 8x8 matrices are loaded
+                const float *C_src =
+                    reinterpret_cast<float *>(Cs_ld + chunk_start + swizzled_x * 8);
                 // mma expects the second operand to be in col major,
                 // since we need C^t there's no need to transpose
-                ldmatrix_sync_m8n8_x2_b16(C_slice + (mma_x * 8 + mat_row) *
-                                          HeadDimK / 2 + mat_x * 4, C_frag[mma_x]);
+                ldmatrix_sync_m8n8_x2_b16(C_src + (mma_x * 8 + mat_row) *
+                                          HeadDimK / 2, C_frag[mma_x]);
             }
 
             #pragma unroll
@@ -776,6 +796,10 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
         #pragma unroll
         for (int mma_y = 0; mma_y < NumMmasOutY; ++mma_y) {
+            // Note there are enough Ps slices to span all 32 banks,
+            // so swizzling could be done here as well, but that would require
+            // revisiting the softmax section.
+
             // We're loading a 32x16 tile into registers with two 16x16 ldmatrix
             // instructions for Q as well, so this could be wrapped in a function
             ldmatrix_sync_m8n8_x4_b16(reinterpret_cast<float *>(Ps) +
@@ -786,10 +810,15 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
 
         #pragma unroll // unroll factor may be relevant for pipelining
         for (int mma_x = 0; mma_x < NumMmasOutX; ++mma_x) {
+            // Same deal here with swizzling, that's easy enough :/
+            const int mma_offset_x = warp_idx * NumMmasOutX * 8 + mma_x * 8;
+
+            const uint32_t chunk_start = mma_offset_x & ~63u;
+            const uint32_t swizzled_x = mat_row ^ ((mma_offset_x & 63u) / 8);
+
             // Load C fragments, then issue corresponding mmas
             float *__restrict__ C_frag_src =
-                reinterpret_cast<float *>(Cs_ld + warp_idx * NumMmasOutX * 8 +
-                                          mma_x * 8) +
+                reinterpret_cast<float *>(Cs_ld + chunk_start + swizzled_x * 8) +
                     // threads 0-7 load upper half, 8-15 lower half,
                     // each pointing to a unique row of the 16x8 16-bit matrix
                     (mat_x * 8 + mat_row) * HeadDimK / 2;
