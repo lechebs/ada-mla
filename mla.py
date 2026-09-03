@@ -11,11 +11,11 @@ from torch.utils.benchmark import Timer, Compare
 module = load(
     name="ada_mla",
     sources=[
-        "mla_api.cpp",
-        "mla_decode_naive_fp32_cpu.cpp",
-        "mla_decode_naive_fwd.cu",
-        "mla_decode_fused_fwd_sm89.cu",
-        "mla_decode_splitk_fwd_sm89.cu",
+        "csrc/mla_api.cpp",
+        "csrc/mla_decode_naive_fp32_cpu.cpp",
+        "csrc/mla_decode_naive_fwd.cu",
+        "csrc/mla_decode_fused_fwd_sm89.cu",
+        "csrc/mla_decode_splitk_fwd_sm89.cu",
     ],
     extra_cuda_cflags=["-arch=sm_89", "-lineinfo", "--ptxas-options=-v"],
     verbose=True)

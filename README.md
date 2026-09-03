@@ -1,41 +1,191 @@
-## Fused tiling strategy
+# Multihead Latent Attention decoding kernel for Ada GPUs
+
+## Requirements
+
+The code was developed and tested on PyTorch 2.12.1 and CUDA 13.2.
+
+Install the dependencies with `pip install -r requirements.txt`
+
+The code targets `sm_89`, but informally supports `sm_80` as well.
+
+PyTorch CUDA extension, available inside the script as a Python module via PyBind11.
+
+## Usage
+
+The `mla.py` scripts contains some boilerplate to verify the correctness of the implementation and perform a quick benchmark with `torch.Timer`.
 
 ```
-                                                    +--------------+
-                                                    |//////////////|
-                CTileN                              +--------------+
-                +---+----------------+              |              |
-                |///| QTileK         |              |              |
-                +---+----------------+              |              |
-                |///|                |              |              |
-                |///|                |              |              |
-                |///|                |              |              |
-QTileK          +---+----------------+              +--------------+
-+-------------+ +---+----------------+  ^           +--------------+
-|/////////////| |   | --->           |  |           |              |
-+-------------+ +---+----------------+ num_heads    +--------------+
-|             | |                    |  |           |              |
-+-------------+ +--------------------+  v           +--------------+
-<---HeadDim---> <-----seq_length----->
+python3 mla.py --test --seq-length 4096 -k fused
 
-|   \
-|    \          |   \
-|     \         |    \
-+------+        +----+      ^
-|//////|        |    |      |
-|//////|        |    |      |
-+------+        +----+   QTileM=32
-|//////|        |    |      |
-|//////|        |    |      |
-+------+        +----+      v
-
-<------>        <---->
-QTileK=16      CTileN=8
+python3 mla.py --benchmark -s 4096 8192 16384 -k torch split --fp16
 ```
 
-HeadDim = 576
+## Multihead Latent Attention
 
-## Worklog
+Proposed in DeepSeekV2.. weight absorption math here.
+
+### MLA in practice
+
+Quite simple if you get past the math stage, softmax(QC^T)C
+
+flash-attention, and why fusion.
+
+## Kernels
+
+The implemented kernels operate in the weight absorbed regimes.
+
+PyTorch eager was used as baseline (or better, as target).
+
+`torch.nn.attention.scaled_dot_product_attention` has multiple backends, the only two that are compatible with `head_dim=576` are the `MATH` backend and the `MEMORY_EFFICIENT` (a Triton implementation from the xformers library).
+
+### Fused (FP32)
+
+The fused kernel was later profiled in split-k manner, but formally lacks a combine.
+
+### Split-K fused (FP16)
+
+```
+ - grid tiles:
+                                                                                          512             64
+                                                                               +-------------------------+--+
+                                                                               |/////////////////////////|  |
+                                                                               |/////////////////////////|  |
+                                                    seq_len       C^t          |/////////////////////////|  |
+                                     +-------------------------------------+   |/////////////////////////|  |  C
+                                     |//////////////////|                  |   |/////////////////////////|  |
+                                     |//////////////////|                  |   |/////////////////////////|  |
+                                     |//////////////////|                  |   |/////////////////////////|  |
+                                     |//////////////////|                  |   |-------------------------+  | seq_len
+                                     |//////////////////|                  |   |                         |  |
+                                576  |//////////////////|                  |   |                         |  |
+                                     |//////////////////|                  |   |                         |  |
+                                     |//////////////////|                  |   |                         |  |
+                                     |//////////////////|                  |   |                         |  |
+                                     |//////////////////|                  |   |                         |  |
+                                     |//////////////////|                  |   |                         |  |
+                                     +-------------------------------------+   +-------------------------+--+
+                   Q
+     +---------------------------+   +------------------+------------------+   +-------------------------+
+     |///////////////////////////|   |///////cta0///////|       cta4       |   |//////////cta0///////////| 32
+     |---------------------------|   +------------------+------------------+   |-------------------------|
+     |                           |   |       cta1       |       cta5       |   |          cta1           |
+ 128 |---------------------------|   +------------------+------------------+   |-------------------------|  O
+     |                           |   |       cta2       |       cta6       |   |          cta2           |
+     |---------------------------|   +------------------+------------------+   |-------------------------|
+     |                           |   |       cta3       |       cta7       |   |          cta3           |
+     +---------------------------+   +------------------+------------------+   +-------------------------+
+                  576                                   P                                   +
+                                                                               +-------------------------+
+                                                                               |          cta4           |
+                                                                               |-------------------------|
+                                                                               |          cta5           |
+                                                                               |-------------------------|
+                                                                               |          cta6           |
+                                                                               |-------------------------|
+                                                                               |          cta7           |
+                                                                               +-------------------------+
+
+    Q is split vertically into 32x576 thread block tiles, C is split across the
+    sequence lenght dimension to saturate all SMs (two splits is enough for 16 SMs).
+    Note that P tiles are not materialized in gmem. Splits partial results
+    are later reduced with a separate kernel.
+
+                                                          512
+ - thread block tiles:                            +--------------+-+
+                                                  |//////////////| |Cs
+                                                  +--------------+-+
+                                                  |              | |
+                        Cs       seq_len/2        |              | |
+                       +--+---------------------+ |              | |
+                       |//|                     | |              | | seq_len/2
+                       |//|                     | |              | |
+                  576  |//|     -->             | |              | |
+                       |//|                     | |              | |
+                       |//|                     | |              | |
+            Qs         +--+---------------------+ +--------------+-+
+    +----------------+ +--+---------------------+ +--------------+
+ 32 |////////////////| |//| Ps  -->             | |//////////////| Or
+    +----------------+ +--+---------------------+ +--------------+
+           576          16
+
+    each thread block is assigned a tile of Q that spans the entire head
+    dimension and iterates over the tiles of a chunk of C.
+
+ - warp tiles:
+
+                                                  16
+                                                +----+
+                                                |/w0/| 16
+                                                +----+
+                                                | w1 |
+                                                +----+
+                                                | w2 |
+                                                +----+
+                                                | w3 |
+                                                +----+ Cs
+                                                |/w0/|
+                                                +----+
+                                                | w1 |
+                                                +----+
+                                                | .. |                128           Cs
+                                                +----+             +-------+-------+-------+-------+--+
+                                                | w3 |             |///////|       |       |       |  |
+                                                +----+             +-------+-------+-------+-------+--+
+
+    +----+----+----+----+----+----+----+----+   +----+     +----+  +-------+-------+-------+-------+
+    |/w0/| w1 | w2 | w3 |/w0/| w1 | .. | w3 |   |/w0/|  =  |////|  |/warp0/| warp1 | warp2 | warp3 |  Or
+ 32 |////|    |    |    |////|    |    |    |   |////|     |////|  |///////|       |       |       |
+    +----+----+----+----+----+----+----+----+   +----+     +----+  +-------+-------+-------+-------+
+      16               Qs                         +          Ps                  512  
+                                                +----+
+                                                | w1 | Pr
+                                                |    |
+                                                +----+
+                                                  +
+                                                +----+
+                                                | w2 |
+                                                |    |
+                                                +----+
+                                                  +
+                                                +----+
+                                                | w3 |
+                                                |    |
+                                                +----+
+
+    the QC^t product is performed as a slice-k gemm, each warp accumulates
+    a partial product by performing a 32x144x16 gemm split across 9 32x16x16 slices,
+    which is followed by a block wide reduction.
+
+
+ - mma tiles:
+                      8    8                             8        128
+                  +----+----+                        +----+----+----+----+----+
+                  |////|    |                        |////|    |    |    |    |
+         C_frag   |////|    |               C_frag   |////|    |    | .. |    |
+                  |////|    |                        |////|    |    |    |    |
+                  |////|    |                        |////|    |    |    |    |
+                  +----+----+                        +----+----+----+----+----+
+       Q_frag                              16
+    +---------+   +----+----+          +---------+   +----+----+----+----+----+
+    |/////////|   |////|    |          |/////////|   |////|    |    |    |    |
+ 16 |/////////|   |mma0|mma1|          |/////////|   |mma0|mma2|mma4| .. | mma|
+    |/////////|   |////|    |          |/////////|   |////|    |    |    | 31 |
+    |/////////|   |////|    |          |/////////|   |////|    |    |    |    |
+    +---------+   +----+----+          +---------+   +----+----+----+----+----+
+    |         |   |    |    |          |         |   |    |    |    |    |    |
+ 16 |         |   |mma2|mma3|          |         |   |mma1|mma3|mma5| .. | mma|
+    |         |   |    |    |          |         |   |    |    |    |    | 32 |
+    |         |   |    |    |          |         |   |    |    |    |    |    |
+    +---------+   +----+----+          +---------+   +----+----+----+----+----+
+        16          P_frag               P_frag                O_frag
+
+    each warp issues 4 m16n8k16 mma instructions per QC^t slice (36 mmas)
+    and 32 m16n8k16 mma instructions for PC.
+```
+
+Uses Tensor Cores, beats PyTorch!
+
+## Optimization worklog
 
 Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread blocks of size `256`.
 
@@ -72,6 +222,19 @@ Moving to ncu execution time (more precises, flushes caches at each iteration).
 | + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|33%|
 | + avoid Qs bank conflicts + avoid Ps store conditional + full Qr tiling   |*0.404|36%|
 (*excluding splitkv reduce kernel)
+
+times for fp16
+
+|kernel|time (ms)| peak flops (tops) |
+|splitk_mma|..||
+|splitk
+
+## Future works
+
+- BF16 support should be fairly straightforward, given the templated nature of the code.
+- FP8 quantized KV cache could be a good candidate for Ada, which has native support for FP8.
+
+## Notes
 
 - Using shmem to accumulate output results degrades performance apparently.
 - I think I've to quickly move to fp16, otherwise shmem isn't enough!
@@ -139,43 +302,19 @@ This intuiton is confirmed by the ptx docs: "When reading 8x8 matrices, a group 
 
 - Benchmark also with a bigger batch size.
 
-## TODO
-
-- Avoid Cs padding.
-- Choose a number of warps that divides evenly Cs size -> 9 should be good, but it doesn't seem to reduce overall sync stalls for some reason.. only for the PC loop. I guess sync latency could be hidden by fitting two blocks on each SM.
-
-- Slice-k with more than 8 warps -> tried with 9, sync latency after QC^T loop increases.
-- 2D coarsening -> increase QTileM.
-- Move to fp16 to reduce shmem requirements and fit two blocks in each SM.
-- Split-k.
-- Try to pipeline shmem->reg loads (how the hell?)
-
-## Roadmap
-
-- naive fused
-- flash-attn optimizations
-- gemm optimizations
-  - cutlass hierarchy
-  - vector loads
-  - shmem bank conflicts
-  - mma
-  - sw pipelining
-- fp8
-
-- KV cache update?
-
-Compare against flash-attention decoding, FlashMLA doesn't support Ada.
+- Compare against flash-attention decoding.
 
 ## References
 
-- https://x.com/karpathy/status/1789666350878601581
+Some useful and/or inspiring resources that I stumbled upon while working on this project.
 
+- https://x.com/karpathy/status/1789666350878601581
 - https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html
 - https://docs.pytorch.org/cppdocs/index.html
 - https://pybind11.readthedocs.io/en/stable/index.html
 - https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-reference
 - https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions
-
+- https://blog.ezyang.com/2019/05/pytorch-internals/
 - https://siboehm.com/articles/22/CUDA-MMM
 - https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog
 - https://www.spatters.ca/mma-matmul
@@ -183,30 +322,22 @@ Compare against flash-attention decoding, FlashMLA doesn't support Ada.
 - https://gau-nernst.github.io/fa-5090/
 - https://salykova.github.io/sgemm-gpu
 - https://www.aleksagordic.com/blog/matmul
-
 - https://github.com/NVIDIA/cutlass#documentation
+- https://github.com/deepseek-ai/FlashMLA
 - https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html
 - https://developer.nvidia.com/blog/cutlass-linear-algebra-cuda/
 . https://www.nvidia.com/en-us/on-demand/session/gtcsiliconvalley2018-s8854/
 - https://www.nvidia.com/en-us/on-demand/session/gtcsj20-s21745/
-
-- https://mlc.ai/modern-gpu-programming-for-mlsys/index.html
-
+- https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/
 - https://www.youtube.com/watch?v=Y-o545eYjXM
 - https://www.youtube.com/@GPUMODE
 - https://www.youtube.com/watch?v=0VLAoVGf_74
-
 - https://arxiv.org/abs/1805.02867
 - https://arxiv.org/abs/2205.14135
 - https://arxiv.org/pdf/2307.08691
 - https://arxiv.org/abs/2407.08608
 - https://arxiv.org/abs/2405.04434
 - https://crfm.stanford.edu/2023/10/12/flashdecoding.html
-
-## Suggested reads
-
-- https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/
-- https://blog.ezyang.com/2019/05/pytorch-internals/
 - https://hazyresearch.stanford.edu/blog/2024-05-12-tk
 - https://dl.acm.org/doi/10.1145/1356052.1356053
 - https://www.cs.cmu.edu/~mgormley/courses/10423/schedule.html
