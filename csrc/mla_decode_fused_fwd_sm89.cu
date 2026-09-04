@@ -18,12 +18,11 @@ void run_mla_decode_fused(const float *query,
 
     const int num_stages = 3;
 
-    const int num_sms = 16; // TODO: query device properties
+    //const int num_sms = 16; // TODO: query device properties
 
     // NOTE: To check correctness with a different choice
     // of q_tile_m, you can override this to 1.
-    const int num_splits = num_sms / (num_heads / q_tile_m);
-
+    const int num_splits = 1;//num_sms / (num_heads / q_tile_m);
     // WARNING: Reduce after split is missing!
 
     dim3 block(c_tile_n, q_tile_m);

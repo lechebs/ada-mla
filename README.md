@@ -1,51 +1,133 @@
-# Multihead Latent Attention decoding kernel for Ada GPUs
+# MLA decode kernel for Ada GPUs
+
+Fused CUDA kernels for DeepSeek-V2 Multi-head Latent Attention (MLA) decoding, targeted for Ada Lovelace GPUs, faster than naive `torch.compile` in FP16 (on RTX 500 Ada Laptop GPU).
+
+The kernels were hand-tuned on a RTX 500 Ada Laptop GPU, so performance is not guaranteed to be optimal for deskop or server Ada GPUs.
 
 ## Requirements
 
-The code was developed and tested on PyTorch 2.12.1 and CUDA 13.2.
+- PyTorch 2.0 >=
+- CUDA Toolkit (`nvcc`) >= 11.8
+- `sm_89` (for `sm_80` see below)
 
-Install the dependencies with `pip install -r requirements.txt`
+The code was developed and tested on PyTorch 2.12.1 and CUDA Toolkit 13.2. The exact Python dependencies used can be installed with `pip install -r requirements.txt`, but it should run on earlier versions of PyTorch 2.X.
 
-The code targets `sm_89`, but informally supports `sm_80` as well.
+The `mla.py` script builds the CUDA kernels JIT, so `nvcc` is required.
 
-PyTorch CUDA extension, available inside the script as a Python module via PyBind11.
+The kernels targets `sm_89` shared memory size (101KB), but can run on `sm_80` as well, although performance may not be optimal.
 
 ## Usage
 
-The `mla.py` scripts contains some boilerplate to verify the correctness of the implementation and perform a quick benchmark with `torch.Timer`.
+The `mla.py` scripts contains some boilerplate to verify the correctness of the implementation and perform a benchmark with either `torch.Timer` (wall time) and `triton.testing` (cuda events time, flushes L2).
 
 ```
 python3 mla.py --test --seq-length 4096 -k fused
 
-python3 mla.py --benchmark -s 4096 8192 16384 -k torch split --fp16
+python3 mla.py --triton-bench -s 4096 8192 16384 --kernel-name torch fused
+python3 mla.py --timer-bench -k torch sdpa-math fused --fp32
 ```
 
-## Multihead Latent Attention
+The script can compare different MLA backends, which use FP16 by default:
+- `torch.compile`d naive torch implementation (`-k torch`)
+- [`torch.nn.functional.scaled_dot_production_attention`](https://docs.pytorch.org/docs/2.14/generated/torch.nn.functional.scaled_dot_product_attention.html#torch-nn-functional-scaled-dot-product-attention) used with `SDPBackend.MATH` or `SDPBackend.EFFICIENT_ATTENTION` (`-k sdpa-math spda-efficient`) and `key=value`.
+- custom CUDA fused implementation (`-k fused`)
 
-Proposed in DeepSeekV2.. weight absorption math here.
+FlashAttention and cuDNN backends for `scaled_dot_product_attention` were not considered due to incompatibilty with MLA `head_dim=576`.
+
+The `--fp32` flag forces the usage of FP32 precision and inhibits the usage of Tensor Cores.
+
+
+## Multi-head Latent Attention
+
+Proposed in DeepSeek-V2.. weight absorption math here.
 
 ### MLA in practice
 
 Quite simple if you get past the math stage, softmax(QC^T)C
 
-flash-attention, and why fusion.
+flash-attention and fusion.
 
 ## Kernels
 
 The implemented kernels operate in the weight absorbed regimes.
 
-PyTorch eager was used as baseline (or better, as target).
-
-`torch.nn.attention.scaled_dot_product_attention` has multiple backends, the only two that are compatible with `head_dim=576` are the `MATH` backend and the `MEMORY_EFFICIENT` (a Triton implementation from the xformers library).
-
 ### Fused (FP32)
 
-The fused kernel was later profiled in split-k manner, but formally lacks a combine.
+```
+                                                    +--------------+
+                                                    |//////////////| CTileN
+                CTileN                              +--------------+
+                +---+----------------+              |              |
+                |///| QTileK         |              |              |
+                +---+----------------+              |              |
+                |///|                |              |              |
+                |///|                |              |              |
+                |///|                |              |              |
+QTileK          +---+----------------+              +--------------+
++-------------+ +---+----------------+  ^           +--------------+
+|/////////////| |   | --->           |  |           |              |
++-------------+ +---+----------------+ num_heads    +--------------+
+|             | |                    |  |           |              |
++-------------+ +--------------------+  v           +--------------+
+<---HeadDim---> <-----seq_length----->
+
+|   \
+|    \          |   \
+|     \         |    \
++------+        +----+      ^
+|//////|        |    |      |
+|//////|        |    |      |
++------+        +----+   QTileM=32
+|//////|        |    |      |
+|//////|        |    |      |
++------+        +----+      v
+
+<------>        <---->
+QTileK=16      CTileN=8
+```
+
+Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread blocks of size `256`.
+
+|kernel|time (ms)|
+|:-----|--------:|
+|pytorch eager                                         |0.315|
+||
+|naive (non fused gemm [`QM=QK=CN=16`] + softmax)      | 1.61|
+||
+|fused (fully tiled)  [`QM=QK=CN=16`]                  |  ~30|
+| + (no C vertical tiling) [`QM=32 QK=16 CN=8`]        |19.29|
+| + (no Q horizontal tiling) [`QM=32 QK=16 CN=8`]      |14.27|
+| + [`QM=QK=CN=16`]                                    | 7.21|
+| + [`QM=8 QK=16 CN=32`]                               | 3.72|
+| + allow unrolling Q and C gmem->shmem loops          | 2.64|
+| + slice-k QC^T product with vertical coarsening      | 1.18|
+| + warp-parallel PC product with vertical coarsening  | 1.02|
+| + vectorized C load with unroll 4                    |0.964|
+| + padding Cs to avoid bank conflicts                 |0.751|
+
+Moving to ncu execution time (more precises, flushes caches at each iteration).
+|kernel|time (ms)| peak flops (fp32) |
+|:-----|---:|---:|
+|pytorch eager (head_dim_v fix)                                              |0.357|48%|
+||
+| (fused) vectorized C load with unroll 4                                    |1.190|13%|
+| + padding Cs to avoid bank conflicts                                       |0.934|16%|
+| + 2-stage pipeline to load C                                               |0.795|19%|
+| + 3-stage pipeline to load C                                               |0.769|20%|
+| + two cols coarsening for PC product                                       |0.664|22%|
+| + two cols coarsening for QC^T product [`QTileK=8`]                        |0.641|24%|
+| + head_dim_v fix :P                                                        |0.566|25%|
+| + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|33%|
+| + avoid Qs bank conflicts + avoid Ps store conditional + full Qr tiling   |*0.404|36%|
+(*excluding splitk reduce kernel)
 
 ### Split-K fused (FP16)
 
+#### Grid level
+
+Q is split vertically into 32x576 thread block tiles, C is split across the sequence lenght dimension to saturate all SMs (two splits is enough for 16 SMs). Note that P tiles are not materialized in gmem. Splits partial results are later reduced with a separate kernel.
+
 ```
- - grid tiles:
                                                                                           512             64
                                                                                +-------------------------+--+
                                                                                |/////////////////////////|  |
@@ -84,14 +166,15 @@ The fused kernel was later profiled in split-k manner, but formally lacks a comb
                                                                                |-------------------------|
                                                                                |          cta7           |
                                                                                +-------------------------+
+```
 
-    Q is split vertically into 32x576 thread block tiles, C is split across the
-    sequence lenght dimension to saturate all SMs (two splits is enough for 16 SMs).
-    Note that P tiles are not materialized in gmem. Splits partial results
-    are later reduced with a separate kernel.
+#### Thread-block level
 
+Each thread block is assigned a tile of Q that spans the entire head dimension and iterates over the tiles of a chunk of C.
+
+```
                                                           512
- - thread block tiles:                            +--------------+-+
+                                                  +--------------+-+
                                                   |//////////////| |Cs
                                                   +--------------+-+
                                                   |              | |
@@ -107,12 +190,13 @@ The fused kernel was later profiled in split-k manner, but formally lacks a comb
  32 |////////////////| |//| Ps  -->             | |//////////////| Or
     +----------------+ +--+---------------------+ +--------------+
            576          16
+```
 
-    each thread block is assigned a tile of Q that spans the entire head
-    dimension and iterates over the tiles of a chunk of C.
+#### Warp level
 
- - warp tiles:
+The QC^t product is performed as a slice-k gemm, each warp accumulates a partial product by performing a 32x144x16 gemm split across 9 32x16x16 slices, which is followed by a block wide reduction.
 
+```
                                                   16
                                                 +----+
                                                 |/w0/| 16
@@ -151,13 +235,10 @@ The fused kernel was later profiled in split-k manner, but formally lacks a comb
                                                 | w3 |
                                                 |    |
                                                 +----+
+```
+Each warp issues 4 m16n8k16 mma instructions per QC^t slice (36 mmas) and 32 m16n8k16 mma instructions for PC.
 
-    the QC^t product is performed as a slice-k gemm, each warp accumulates
-    a partial product by performing a 32x144x16 gemm split across 9 32x16x16 slices,
-    which is followed by a block wide reduction.
-
-
- - mma tiles:
+```
                       8    8                             8        128
                   +----+----+                        +----+----+----+----+----+
                   |////|    |                        |////|    |    |    |    |
@@ -178,56 +259,17 @@ The fused kernel was later profiled in split-k manner, but formally lacks a comb
     |         |   |    |    |          |         |   |    |    |    |    |    |
     +---------+   +----+----+          +---------+   +----+----+----+----+----+
         16          P_frag               P_frag                O_frag
-
-    each warp issues 4 m16n8k16 mma instructions per QC^t slice (36 mmas)
-    and 32 m16n8k16 mma instructions for PC.
 ```
 
-Uses Tensor Cores, beats PyTorch!
-
-## Optimization worklog
-
-Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread blocks of size `256`.
-
-|kernel|time (ms)|
-|:-----|--------:|
-|pytorch eager                                         |0.315|
-||
-|naive (non fused gemm [`QM=QK=CN=16`] + softmax)      | 1.61|
-||
-|fused (fully tiled)  [`QM=QK=CN=16`]                  |  ~30|
-| + (no C vertical tiling) [`QM=32 QK=16 CN=8`]        |19.29|
-| + (no Q horizontal tiling) [`QM=32 QK=16 CN=8`]      |14.27|
-| + [`QM=QK=CN=16`]                                    | 7.21|
-| + [`QM=8 QK=16 CN=32`]                               | 3.72|
-| + allow unrolling Q and C gmem->shmem loops          | 2.64|
-| + slice-k QC^T product with vertical coarsening      | 1.18|
-| + warp-parallel PC product with vertical coarsening  | 1.02|
-| + vectorized C load with unroll 4                    |0.964|
-| + padding Cs to avoid bank conflicts                 |0.751|
-
-Moving to ncu execution time (more precises, flushes caches at each iteration).
-|kernel|time (ms)| peak flops (fp32) |
-|:-----|---:|---:|
-|pytorch eager                                                               |0.434|48%|
-|pytorch eager (head_dim_v fix)                                              |0.357|48%|
-||
-| (fused) vectorized C load with unroll 4                                    |1.190|13%|
-| + padding Cs to avoid bank conflicts                                       |0.934|16%|
-| + 2-stage pipeline to load C                                               |0.795|19%|
-| + 3-stage pipeline to load C                                               |0.769|20%|
-| + two cols coarsening for PC product                                       |0.664|22%|
-| + two cols coarsening for QC^T product [`QTileK=8`]                        |0.641|24%|
-| + head_dim_v fix :P                                                        |0.566|25%|
-| + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|33%|
-| + avoid Qs bank conflicts + avoid Ps store conditional + full Qr tiling   |*0.404|36%|
-(*excluding splitkv reduce kernel)
-
-times for fp16
-
-|kernel|time (ms)| peak flops (tops) |
-|splitk_mma|..||
-|splitk
+On RTX 500 Ada, the custom FP16 fused kernel is up to **~60% faster** than PyTorch.
+```
+seq_len  torch (ms)  sdpa-math (ms)  sdpa-efficient (ms)  fused (ms)
+   1024    0.038977        0.114741             0.086278    0.030333
+   4096    0.114045        0.445278             0.338340    0.085225
+   8192    0.210993        1.040483             0.671503    0.147075
+  16384    0.466971        2.196881             1.345726    0.277554
+  32756    0.919680        4.218112             2.654663    0.538043
+```
 
 ## Future works
 
@@ -326,7 +368,7 @@ Some useful and/or inspiring resources that I stumbled upon while working on thi
 - https://github.com/deepseek-ai/FlashMLA
 - https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html
 - https://developer.nvidia.com/blog/cutlass-linear-algebra-cuda/
-. https://www.nvidia.com/en-us/on-demand/session/gtcsiliconvalley2018-s8854/
+- https://www.nvidia.com/en-us/on-demand/session/gtcsiliconvalley2018-s8854/
 - https://www.nvidia.com/en-us/on-demand/session/gtcsj20-s21745/
 - https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/
 - https://www.youtube.com/watch?v=Y-o545eYjXM

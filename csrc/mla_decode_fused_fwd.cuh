@@ -19,8 +19,8 @@ __device__ __forceinline__ void pipeline_prefetch_kv_tile(
              j < num_slices_per_warp * QTileK * CTileN / 4; j += WARP_SIZE) {
 
         // Coordinates within the tile
-        const int tile_i = j / (2 * QTileK / 4);
-        const int tile_j = j % (2 * QTileK / 4);
+        const int tile_i = j / (num_slices_per_warp * QTileK / 4);
+        const int tile_j = j % (num_slices_per_warp * QTileK / 4);
 
         const float *src = gmem_src + tile_i * HeadDim + 4 * tile_j;
         // Convert generic pointer to shared space state
@@ -78,6 +78,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
 
     __syncthreads();
 
+    // WARNING: better initializing prev_max as -inf
     float prev_max = 0.0f; // max logit of prev Ps tile
     float prev_sum = 0.0f; // denominator of prev Ps tile
 
@@ -178,6 +179,8 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             for (int k = 0; k < QTileK; ++k) {
                 #pragma unroll
                 for (int n = 0; n < TN; ++n) {
+                    // NOTE: The thread tile is not contiguous in the x direction,
+                    // this is why Cs padding is effective
                     float Cr = Cs[(n * num_t_cols + tx) *
                                   (HeadDim + 4) + Q_j + slice_offset + k];
                     #pragma unroll
@@ -233,7 +236,7 @@ __global__ void mla_decode_fused(const float *__restrict__ Q,
             log += Ps[QTileM * CTileN * w + threadIdx.y * CTileN + threadIdx.x];
         }
 
-        log /= sqrtf(HeadDim);
+        log /= sqrtf(192); // d_h + d_h_rope = 128 + 64
 
         // TODO: The softmax section could probably be revisited.
 

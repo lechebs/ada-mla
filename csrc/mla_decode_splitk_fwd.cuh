@@ -707,11 +707,6 @@ __global__ void mla_decode_splitk_mma_fp16(const __half *__restrict__ Q,
             float Q_frag[NumMmasPerSliceY][4]; // {a0, a1}, {a2, a3}, {a4, a5}, {a6, a7}
             float C_frag[NumMmasPerSliceX][2]; // {b0, b1}, {b2, b3}
 
-            const float *Q_slice = // TODO: advance ptrs instead of adding the offset
-                reinterpret_cast<const float *>(Qs + slice_offset);
-            const float *C_slice =
-                reinterpret_cast<const float *>(Cs_ld + slice_offset);
-
             // Each quarter warp loads one 8x8 matrix of the Q slice, and
             // each of the first two quarter warps load one 8x8 tile of the C slice
 

@@ -8,6 +8,8 @@ from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.cpp_extension import load
 from torch.utils.benchmark import Timer, Compare
 
+import triton.testing
+
 module = load(
     name="ada_mla",
     sources=[
@@ -17,67 +19,72 @@ module = load(
         "csrc/mla_decode_fused_fwd_sm89.cu",
         "csrc/mla_decode_splitk_fwd_sm89.cu",
     ],
-    extra_cuda_cflags=["-arch=sm_89", "-lineinfo", "--ptxas-options=-v"],
+    extra_cuda_cflags=["-gencode=arch=compute_89,code=sm_89",
+                       "-gencode=arch=compute_80,code=sm_80", # supports Ampere
+                       "-lineinfo"],
     verbose=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # TODO: These constants should be exported by the C++ module
 NUM_HEADS = 128
-HEAD_DIM_K = 576
-HEAD_DIM_V = 512
+HEAD_DIM = 128
+HEAD_DIM_C = 512
+HEAD_DIM_ROPE = 64
+HEAD_DIM_K = HEAD_DIM_C + HEAD_DIM_ROPE
 
 mla_decode_naive = module.mla_decode_naive
 mla_decode_fused = module.mla_decode_fused
 mla_decode_split = module.mla_decode_split
 
-# torch.set_float32_matmul_precision("high") # to use tensor cores for fp32
+# torch.set_float32_matmul_precision("high") # uses tensor cores for torch fp32
 
 torch.manual_seed(42)
 
-def mla_decode_torch(q: torch.Tensor,
-                     c: torch.Tensor,
-                     head_dim_k: int=HEAD_DIM_K,
-                     head_dim_v: int=HEAD_DIM_V) -> torch.Tensor:
-    return torch.softmax(
-        q @ c.T / ((NUM_HEADS + 64) ** 0.5), dim=-1) @ c[:, :head_dim_v]
+@torch.compile
+def mla_decode_torch(q: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(q @ c.T / ((HEAD_DIM + HEAD_DIM_ROPE) ** 0.5),
+                         dim=-1) @ c[:, :HEAD_DIM_C]
 
+@torch.compile
 def mla_decode_sdpa(q: torch.Tensor,
                     c: torch.Tensor,
-                    head_dim_v: int=HEAD_DIM_V) -> torch.Tensor:
+                    # xformers (mlsk) triton backend
+                    backend=SDPBackend.EFFICIENT_ATTENTION) -> torch.Tensor:
     # flash_attn and cuddn attention are not compatible with current head_dim
-    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION): # xformers (mlsk) triton backend
+    with sdpa_kernel(backend):
         # EFFICIENT_ATTENTION is faster on fp16, MATH is faster on fp32
         # TODO: Benchmark against GQA with enable_qga=True
         return scaled_dot_product_attention(
             q[None, None, :, :],
             c[None, None, :, :],
-            c[None, None, :, :head_dim_v],
-            scale=1.0 / ((NUM_HEADS + 64) ** 0.5))
+            c[None, None, :, :HEAD_DIM_C],
+            scale=1.0 / ((HEAD_DIM + HEAD_DIM_ROPE) ** 0.5))
+
+mla_decode_sdpa_efficient = mla_decode_sdpa
+mla_decode_sdpa_math = \
+    lambda q, c: mla_decode_sdpa(q, c, backend=SDPBackend.MATH)
 
 MLA_DECODE_FUNCS = {
     "torch": mla_decode_torch,
-    "sdpa": mla_decode_sdpa,
-    #"naive": mla_decode_naive,
-    "fused": mla_decode_fused,
-    "split": mla_decode_split
+    "sdpa-math": mla_decode_sdpa_math,
+    "sdpa-efficient": mla_decode_sdpa_efficient,
 }
 
-def run_funcs(mla_funcs: list[callable],
+def run_funcs(mla_func_names: list[str],
               num_heads: int,
               seq_lengths: list[int],
               head_dim_k: int=HEAD_DIM_K,
               dtype: torch.dtype=torch.float32,
               num_iters=1):
 
-    q = torch.normal(0, 1, size=(num_heads, head_dim_k),
-                     dtype=dtype).to(DEVICE)
+    q = torch.randn(size=(num_heads, head_dim_k), dtype=dtype).to(DEVICE)
 
     for seq_len in seq_lengths:
-        c = torch.normal(0, 1, size=(seq_len, head_dim_k),
-                         dtype=dtype).to(DEVICE)
+        c = torch.randn(size=(seq_len, head_dim_k), dtype=dtype).to(DEVICE)
 
-        for func in mla_funcs:
+        for func_name in mla_func_names:
+            func = MLA_DECODE_FUNCS[func_name]
             for _ in range(num_iters):
                 func(q, c)
 
@@ -90,101 +97,141 @@ def compute_error(mla_decode_func: callable,
     diff = torch.abs(out - out_ref)
     return torch.max(diff), torch.mean(diff)
 
-def run_test(mla_funcs: list[callable],
+def run_test(mla_func_names: list[str],
              num_heads: int,
              seq_lengths: list[int],
              head_dim_k: int=HEAD_DIM_K,
              dtype: torch.dtype=torch.float32,
              ref_func: callable=mla_decode_torch):
 
-    q = torch.normal(0, 1, size=(num_heads, head_dim_k),
-                     dtype=dtype).to(DEVICE)
+    q = torch.randn(size=(num_heads, head_dim_k), dtype=dtype).to(DEVICE)
 
     for seq_len in seq_lengths:
-        c = torch.normal(0, 1, size=(seq_len, head_dim_k),
-                         dtype=dtype).to(DEVICE)
+        c = torch.randn(size=(seq_len, head_dim_k), dtype=dtype).to(DEVICE)
 
         out_ref = ref_func(q, c)
 
-        for func in mla_funcs:
+        for func_name in mla_func_names:
+            func = MLA_DECODE_FUNCS[func_name]
             diff = torch.abs(func(q, c) - out_ref)
             max_err, mean_err = torch.max(diff), torch.mean(diff)
             rel_mean_err = mean_err / torch.mean(torch.abs(out_ref))
-            print(f"[{func.__name__}] seq_len={seq_len} max={max_err:.6g}"
+            print(f"[{func_name}] seq_len={seq_len} max={max_err:.6g}"
                   f" mean={mean_err:.6g} rel={rel_mean_err:.6f}")
 
-def run_benchmark(mla_funcs: list[callable],
-                  num_heads: int,
-                  seq_lengths: list[int],
-                  head_dim_k: int=HEAD_DIM_K,
-                  dtype: torch.dtype=torch.float32,
-                  num_iters: int=100):
+def run_timer_benchmark(mla_func_names: list[callable],
+                        num_heads: int,
+                        seq_lengths: list[int],
+                        head_dim_k: int=HEAD_DIM_K,
+                        dtype: torch.dtype=torch.float32,
+                        num_iters: int=100):
 
-    q = torch.normal(
-        0, 1, size=(num_heads, head_dim_k), dtype=dtype).to(DEVICE)
+    q = torch.randn(
+        size=(num_heads, head_dim_k), dtype=dtype).to(DEVICE)
 
     results = []
 
     for seq_len in seq_lengths:
-        c = torch.normal(
-            0, 1, size=(seq_len, head_dim_k), dtype=dtype).to(DEVICE)
+        c = torch.randn(
+            size=(seq_len, head_dim_k), dtype=dtype).to(DEVICE)
 
-        for func in mla_funcs:
+        for func_name in mla_func_names:
+            func = MLA_DECODE_FUNCS[func_name]
+            func_name_full = f"mla_decode_{func_name.replace("-", "_")}"
             t = Timer(
                 label=f"seq_len={seq_len}",
-                sub_label=func.__name__,
+                sub_label=func_name,
                 description="time",
-                stmt=f"{func.__name__}(q, c)",
-                setup=f"from __main__ import {func.__name__}",
+                stmt=f"{func_name_full}(q, c)",
+                setup=f"from __main__ import {func_name_full}",
                 globals={"q": q, "c": c})
 
-            results.append(t.timeit(number=num_iters))
+            results.append(t.blocked_autorange())#t.timeit(number=num_iters))
 
     c = Compare(results)
     c.colorize()
     print(c)
+
+def triton_do_bench_mla(seq_len: int,
+                        kernel_name: str,
+                        dtype: torch.dtype) -> float:
+    q = torch.randn((NUM_HEADS, HEAD_DIM_K), dtype=dtype, device=DEVICE)
+    c = torch.randn((seq_len, HEAD_DIM_K), dtype=dtype, device=DEVICE)
+
+    func = lambda: MLA_DECODE_FUNCS[kernel_name](q, c)
+
+    return triton.testing.do_bench(func)
+
+def run_triton_benchmark(kernel_names: list[str],
+                         seq_lengths: list[int],
+                         dtype: torch.dtype=torch.float32):
+
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["seq_len"],
+            x_vals=seq_lengths,
+            line_arg="kernel_name",
+            line_names=kernel_names,
+            line_vals=kernel_names,
+            ylabel="ms",
+            plot_name="mla-bench",
+            args={}
+        )
+    )
+    def benchmark(seq_len: int, kernel_name: str):
+        return triton_do_bench_mla(seq_len, kernel_name, dtype)
+ 
+    benchmark.run(print_data=True, show_plots=False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="mla")
 
     parser.add_argument("--for-ncu", action="store_true")
     parser.add_argument("--test", action="store_true")
-    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--timer-bench", action="store_true")
+    parser.add_argument("--triton-bench", action="store_true")
+
 
     parser.add_argument("-s", "--seq-length", type=int, nargs="+",
-                        default=[4096])
+                        default=[1024, 4096, 8192, 16384, 32756])
 
-    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--fp32", action="store_true")
     # parser.add_argument("--bf16")
 
-    parser.add_argument("-k", "--kernel", nargs="+",
-                        default=MLA_DECODE_FUNCS.keys(),
-                        choices=MLA_DECODE_FUNCS.keys())
+    kernel_names = ["torch", "sdpa-math", "sdpa-efficient", "fused"]
 
-    # parser.add_argument("--num-heads", default=128)
-    # parser.add_argument("--head-dim", default=HEAD_DIM_C)
+    parser.add_argument("-k", "--kernel", nargs="+",
+                        default=kernel_names,
+                        choices=kernel_names)
 
     args = parser.parse_args()
 
-    chosen_funcs = [MLA_DECODE_FUNCS[name] for name in args.kernel]
-    dtype = torch.float16 if args.fp16 else torch.float32
+    if args.fp32:
+        dtype = torch.float32
+        MLA_DECODE_FUNCS["fused"] = mla_decode_fused
+    else:
+        dtype = torch.float16
+        MLA_DECODE_FUNCS["fused"] = mla_decode_split
 
     if args.for_ncu:
-        run_funcs(chosen_funcs,
+        run_funcs(args.kernel,
                   num_heads=NUM_HEADS,
                   seq_lengths=args.seq_length,
                   dtype=dtype)
 
     if args.test:
         #funcs = [f for f in chosen_funcs if f != mla_decode_torch]
-        run_test(chosen_funcs,
+        run_test(args.kernel,
                  num_heads=NUM_HEADS,
                  seq_lengths=args.seq_length,
                  dtype=dtype)
 
-    if args.benchmark:
-        run_benchmark(chosen_funcs,
-                      num_heads=NUM_HEADS,
-                      seq_lengths=args.seq_length,
-                      dtype=dtype,
-                      num_iters=50)
+    if args.timer_bench:
+        run_timer_benchmark(args.kernel,
+                            num_heads=NUM_HEADS,
+                            seq_lengths=args.seq_length,
+                            dtype=dtype)
+
+    if args.triton_bench:
+        run_triton_benchmark(args.kernel, args.seq_length, dtype)
+
