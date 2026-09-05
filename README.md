@@ -1,30 +1,36 @@
 # MLA decode kernel for Ada GPUs
 
-Fused CUDA kernels for DeepSeek-V2 Multi-head Latent Attention (MLA) decoding, targeted for Ada Lovelace GPUs, faster than naive `torch.compile` in FP16 (on RTX 500 Ada Laptop GPU).
+Fused CUDA kernel for DeepSeek-V2 Multi-head Latent Attention (MLA) decoding, targeted for Ada Lovelace GPUs, faster than naive `torch.compile` in FP16 (on RTX 500 Ada Laptop GPU).
 
-The kernels were hand-tuned on a RTX 500 Ada Laptop GPU, so performance is not guaranteed to be optimal for deskop or server Ada GPUs.
+The kernels were hand-tuned on a RTX 500 Ada Laptop GPU, so performance is not guaranteed to be optimal for desktop or server Ada GPUs.
 
 ## Requirements
 
 - PyTorch 2.0 >=
-- CUDA Toolkit (`nvcc`) >= 11.8
+- CUDA Toolkit >= 11.8
+- Ninja
 - `sm_89` (for `sm_80` see below)
 
-The code was developed and tested on PyTorch 2.12.1 and CUDA Toolkit 13.2. The exact Python dependencies used can be installed with `pip install -r requirements.txt`, but it should run on earlier versions of PyTorch 2.X.
+The code was developed and tested on PyTorch 2.12.1. `triton.testing` is packaged with PyTorch, but requires additional dependencies, install them with `pip`:
+```
+pip install matplotlib pandas
+```
 
-The `mla.py` script builds the CUDA kernels JIT, so `nvcc` is required.
+The `mla.py` script builds and loads the CUDA kernels just-in-time. Ninja and `nvcc` from the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) are thus required. Ninja can be installed with `pip`:
+```
+pip install ninja
+```
 
-The kernels targets `sm_89` shared memory size (101KB), but can run on `sm_80` as well, although performance may not be optimal.
+The kernels targets `sm_89` shared memory size (100KB), but can run on `sm_80` as well, although performance may not be optimal.
 
 ## Usage
 
-The `mla.py` scripts contains some boilerplate to verify the correctness of the implementation and perform a benchmark with either `torch.Timer` (wall time) and `triton.testing` (cuda events time, flushes L2).
+The `mla.py` scripts contains some boilerplate to verify the correctness of the implementation against a PyTorch reference and perform benchmarks with `triton.testing.do_bench`, which measures kernels runtime using CUDA events, flusing the L2 cache at each sampling iteration.
 
 ```
-python3 mla.py --test --seq-length 4096 -k fused
+python3 mla.py --test --seq-length 4096 --kernel-name fused
 
-python3 mla.py --triton-bench -s 4096 8192 16384 --kernel-name torch fused
-python3 mla.py --timer-bench -k torch sdpa-math fused --fp32
+python3 mla.py --bench -k torch sdpa-math fused
 ```
 
 The script can compare different MLA backends, which use FP16 by default:
@@ -36,96 +42,29 @@ FlashAttention and cuDNN backends for `scaled_dot_product_attention` were not co
 
 The `--fp32` flag forces the usage of FP32 precision and inhibits the usage of Tensor Cores.
 
-
 ## Multi-head Latent Attention
 
 Proposed in DeepSeek-V2.. weight absorption math here.
 
 ### MLA in practice
 
-Quite simple if you get past the math stage, softmax(QC^T)C
+The actual computation performed by the kernel is `softmax(QC^T/sqrt(d))C`.
+
+### Online softmax
 
 flash-attention and fusion.
 
 ## Kernels
 
-The implemented kernels operate in the weight absorbed regimes.
-
-### Fused (FP32)
-
-```
-                                                    +--------------+
-                                                    |//////////////| CTileN
-                CTileN                              +--------------+
-                +---+----------------+              |              |
-                |///| QTileK         |              |              |
-                +---+----------------+              |              |
-                |///|                |              |              |
-                |///|                |              |              |
-                |///|                |              |              |
-QTileK          +---+----------------+              +--------------+
-+-------------+ +---+----------------+  ^           +--------------+
-|/////////////| |   | --->           |  |           |              |
-+-------------+ +---+----------------+ num_heads    +--------------+
-|             | |                    |  |           |              |
-+-------------+ +--------------------+  v           +--------------+
-<---HeadDim---> <-----seq_length----->
-
-|   \
-|    \          |   \
-|     \         |    \
-+------+        +----+      ^
-|//////|        |    |      |
-|//////|        |    |      |
-+------+        +----+   QTileM=32
-|//////|        |    |      |
-|//////|        |    |      |
-+------+        +----+      v
-
-<------>        <---->
-QTileK=16      CTileN=8
-```
-
-Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread blocks of size `256`.
-
-|kernel|time (ms)|
-|:-----|--------:|
-|pytorch eager                                         |0.315|
-||
-|naive (non fused gemm [`QM=QK=CN=16`] + softmax)      | 1.61|
-||
-|fused (fully tiled)  [`QM=QK=CN=16`]                  |  ~30|
-| + (no C vertical tiling) [`QM=32 QK=16 CN=8`]        |19.29|
-| + (no Q horizontal tiling) [`QM=32 QK=16 CN=8`]      |14.27|
-| + [`QM=QK=CN=16`]                                    | 7.21|
-| + [`QM=8 QK=16 CN=32`]                               | 3.72|
-| + allow unrolling Q and C gmem->shmem loops          | 2.64|
-| + slice-k QC^T product with vertical coarsening      | 1.18|
-| + warp-parallel PC product with vertical coarsening  | 1.02|
-| + vectorized C load with unroll 4                    |0.964|
-| + padding Cs to avoid bank conflicts                 |0.751|
-
-Moving to ncu execution time (more precises, flushes caches at each iteration).
-|kernel|time (ms)| peak flops (fp32) |
-|:-----|---:|---:|
-|pytorch eager (head_dim_v fix)                                              |0.357|48%|
-||
-| (fused) vectorized C load with unroll 4                                    |1.190|13%|
-| + padding Cs to avoid bank conflicts                                       |0.934|16%|
-| + 2-stage pipeline to load C                                               |0.795|19%|
-| + 3-stage pipeline to load C                                               |0.769|20%|
-| + two cols coarsening for PC product                                       |0.664|22%|
-| + two cols coarsening for QC^T product [`QTileK=8`]                        |0.641|24%|
-| + head_dim_v fix :P                                                        |0.566|25%|
-| + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|33%|
-| + avoid Qs bank conflicts + avoid Ps store conditional + full Qr tiling   |*0.404|36%|
-(*excluding splitk reduce kernel)
+The implemented kernels operate in the weight absorbed regimes. Like FlashAttention, MLA can be implemented as a fused GEMM-softmax-GEMM kernel. A split-k reduction over the sequence length, as in FlashDecoding, can be used to increase grid parallelism, at the cost of a final softmax-aware global reduction.
 
 ### Split-K fused (FP16)
 
-#### Grid level
+Q and C are tiled in shared memory, tiles span the entire head dimension. The same Cs tile loaded for QC^t GEMM can be reused for the PC GEMM.
 
-Q is split vertically into 32x576 thread block tiles, C is split across the sequence lenght dimension to saturate all SMs (two splits is enough for 16 SMs). Note that P tiles are not materialized in gmem. Splits partial results are later reduced with a separate kernel.
+#### Thread-block tiles
+
+Q is split vertically into 32x576 thread block tiles, C is split across the sequence lenght dimension to saturate all SMs (here only two splits are shown, enough to fill 8 SMs). Note that P tiles are not materialized in gmem. Splits partial results are later reduced with a separate kernel.
 
 ```
                                                                                           512             64
@@ -168,9 +107,7 @@ Q is split vertically into 32x576 thread block tiles, C is split across the sequ
                                                                                +-------------------------+
 ```
 
-#### Thread-block level
-
-Each thread block is assigned a tile of Q that spans the entire head dimension and iterates over the tiles of a chunk of C.
+Each thread block is assigned a tile of Q that spans the entire head dimension and iterates over the tiles of a chunk of C. Q is loaded into shared memory once at the start of the kernel, while C tiles are double buffered and loaded asynchronously using `cp.async`.
 
 ```
                                                           512
@@ -187,14 +124,14 @@ Each thread block is assigned a tile of Q that spans the entire head dimension a
                        |//|                     | |              | |
             Qs         +--+---------------------+ +--------------+-+
     +----------------+ +--+---------------------+ +--------------+
- 32 |////////////////| |//| Ps  -->             | |//////////////| Or
+ 32 |////////////////| |//| Ps  -->             | |//////////////| Os
     +----------------+ +--+---------------------+ +--------------+
            576          16
 ```
 
-#### Warp level
+#### Warp tiles
 
-The QC^t product is performed as a slice-k gemm, each warp accumulates a partial product by performing a 32x144x16 gemm split across 9 32x16x16 slices, which is followed by a block wide reduction.
+The QC^t product is performed as a slice-k gemm, each warp accumulates a partial product by performing a 32x144x16 gemm split across 9 32x16x16 slices. The resulting fragments are then stored to shared memory, to perform a block wide reduction of the slices, followed by online softmax. The PC product is accumulated entirely into register across iterations over C tiles, with each warp having assigned a contiguous portion of the output. The output fragments are stored to shared memory only after the last iteration, and from shared memory to global memory to allow coalescing.
 
 ```
                                                   16
@@ -217,12 +154,12 @@ The QC^t product is performed as a slice-k gemm, each warp accumulates a partial
                                                 +----+             +-------+-------+-------+-------+--+
 
     +----+----+----+----+----+----+----+----+   +----+     +----+  +-------+-------+-------+-------+
-    |/w0/| w1 | w2 | w3 |/w0/| w1 | .. | w3 |   |/w0/|  =  |////|  |/warp0/| warp1 | warp2 | warp3 |  Or
+    |/w0/| w1 | w2 | w3 |/w0/| w1 | .. | w3 |   |/w0/|  =  |////|  |/warp0/| warp1 | warp2 | warp3 |  O_frag
  32 |////|    |    |    |////|    |    |    |   |////|     |////|  |///////|       |       |       |
     +----+----+----+----+----+----+----+----+   +----+     +----+  +-------+-------+-------+-------+
       16               Qs                         +          Ps                  512  
                                                 +----+
-                                                | w1 | Pr
+                                                | w1 | P_frag
                                                 |    |
                                                 +----+
                                                   +
@@ -236,6 +173,56 @@ The QC^t product is performed as a slice-k gemm, each warp accumulates a partial
                                                 |    |
                                                 +----+
 ```
+Each warp loads a tile from each Ps slice to perform the reduction.
+
+```
+      slice0        slice1             slice3
+   +---------+   +---------+        +---------+
+   |//warp0//| + |//warp0//| + .. + |//warp0//| 
+   +---------+   +---------+        +---------+
+   |  warp1  | + |  warp1  | + .. + |  warp1  |
+   +---------+   +---------+        +---------+
+   |  warp2  | + |  warp2  | + .. + |  warp2  |
+   +---------+   +---------+        +---------+
+ 8 |  warp3  | + |  warp3  | + .. + |  warp3  |
+   +---------+   +---------+        +---------+
+       16
+```
+Reduction across slices tiles is done in batches of 8 contiguous 16-bit values (16 bytes), using warp shuffles.
+```
+             slice0                       slice1                          slice3
+   +-----------------------+    +-----------------------+       +-----------------------+
+   |////t00////|    t01    |    |////t08////|    t09    |       |////t24////|    t25    |
+   |    t02    |    t03    |    |    t10    |    t11    |       |    t26    |    t27    |
+   |    t04    |    t05    |    |    t12    |    t13    |       |    t28    |    t29    |
+   |    t06    |    t07    |    |    t14    |    t15    |       |    t30    |    t31    |
+ 8 +-----------+-----------+    +-----------------------+  ...  +-----------------------+
+   |    t00    |    t01    |    |    t08    |    t09    |       |    t24    |    t25    |
+   |    t02    |    t03    |    |    t10    |    t11    |       |    t26    |    t27    |
+   |    t04    |    t05    |    |    t12    |    t13    |       |    t28    |    t29    |
+   |    t06    |    t07    |    |    t14    |    t15    |       |    t30    |    t31    |
+   +-----------+-----------+    +-----------------------+       +-----------------------+
+         8
+```
+Reduced values are immediately used to perform row-wise softmax using warp shuffles. Each thread handles either the upper or lower half of one of the two 16 byte word that it was responsible for during the warp reduction.
+```
+      4
+   +-----------------------+
+   | t00 | t08 | t01 | t09 |
+   | t02 | t10 | t03 | t11 |
+   | t04 | t12 | t05 | t13 |
+   | t06 | t14 | t07 | t15 |
+ 8 +-----------+-----------+
+   | t16 | t24 | t17 | t25 |
+   | t18 | t26 | t19 | t27 |
+   | t20 | t28 | t21 | t29 |
+   | t22 | t30 | t23 | t31 |
+   +-----------+-----------+
+         8
+```
+
+#### mma tiles
+
 Each warp issues 4 m16n8k16 mma instructions per QC^t slice (36 mmas) and 32 m16n8k16 mma instructions for PC.
 
 ```
@@ -261,15 +248,100 @@ Each warp issues 4 m16n8k16 mma instructions per QC^t slice (36 mmas) and 32 m16
         16          P_frag               P_frag                O_frag
 ```
 
-On RTX 500 Ada, the custom FP16 fused kernel is up to **~60% faster** than PyTorch.
+#### Benchmarks
+
+On RTX 500 Ada, the custom FP16 fused kernel is up to **~40% faster** than PyTorch.
 ```
 seq_len  torch (ms)  sdpa-math (ms)  sdpa-efficient (ms)  fused (ms)
-   1024    0.038977        0.114741             0.086278    0.030333
    4096    0.114045        0.445278             0.338340    0.085225
    8192    0.210993        1.040483             0.671503    0.147075
   16384    0.466971        2.196881             1.345726    0.277554
   32756    0.919680        4.218112             2.654663    0.538043
 ```
+
+On RTX 4000 Ada, the speedup becomes apparent only for larger `seq_len` values.
+```
+seq_len  torch (ms)  sdpa-math (ms)  sdpa-efficient (ms)  fused (ms)
+  16384    0.158138        0.243557             1.437797    0.161660
+  32768    0.340549        0.585690             2.866846    0.301286
+  65536    0.740361        1.227027             5.702724    0.571026
+ 131072    1.488272        2.397253            11.360600    1.111203
+ 262144    3.218193        4.759931            22.669754    2.178991
+```
+
+### Fused (FP32)
+
+Initial efforts were put into iteratively optimizing an FP32 version of the kernel, which does not use Tensor Cores, but operates roughly the same in terms of tiling approach.
+
+```
+                                                    +--------------+
+                                                    |//////////////| CTileN
+                CTileN                              +--------------+
+                +---+----------------+              |              |
+                |///| QTileK         |              |              |
+                +---+----------------+              |              |
+                |///|                |              |              |
+                |///|                |              |              |
+                |///|                |              |              |
+QTileK          +---+----------------+              +--------------+
++-------------+ +---+----------------+  ^           +--------------+
+|/////////////| |   | --->           |  |           |              |
++-------------+ +---+----------------+ num_heads    +--------------+
+|             | |                    |  |           |              |
++-------------+ +--------------------+  v           +--------------+
+<---HeadDim---> <-----seq_length----->
+
+|   \
+|    \          |   \
+|     \         |    \
++------+        +----+      ^
+|//////|        |    |      |
+|//////|        |    |      |
++------+        +----+   QTileM=32
+|//////|        |    |      |
+|//////|        |    |      |
++------+        +----+      v
+
+<------>        <---->
+QTileK=16      CTileN=8
+```
+
+#### Optimization worklog
+
+Benchmarks for `seq_length=4096`, `head_dim=576` and `num_heads=128` with thread blocks of size `256`.
+
+|kernel|time (ms)|
+|:-----|--------:|
+|pytorch eager                                         |0.315|
+||
+|naive (non fused gemm [`QM=QK=CN=16`] + softmax)      | 1.61|
+||
+|fused (fully tiled)  [`QM=QK=CN=16`]                  |  ~30|
+| + (no C vertical tiling) [`QM=32 QK=16 CN=8`]        |19.29|
+| + (no Q horizontal tiling) [`QM=32 QK=16 CN=8`]      |14.27|
+| + [`QM=QK=CN=16`]                                    | 7.21|
+| + [`QM=8 QK=16 CN=32`]                               | 3.72|
+| + allow unrolling Q and C gmem->shmem loops          | 2.64|
+| + slice-k QC^T product with vertical coarsening      | 1.18|
+| + warp-parallel PC product with vertical coarsening  | 1.02|
+| + vectorized C load with unroll 4                    |0.964|
+| + padding Cs to avoid bank conflicts                 |0.751|
+
+Moving to ncu execution time (more precises, flushes caches at each iteration).
+|kernel|time (ms)| peak flops (fp32) |
+|:-----|---:|---:|
+|pytorch eager (head_dim_v fix)                                              |0.357|48%|
+||
+| (fused) vectorized C load with unroll 4                                    |1.190|13%|
+| + padding Cs to avoid bank conflicts                                       |0.934|16%|
+| + 2-stage pipeline to load C                                               |0.795|19%|
+| + 3-stage pipeline to load C                                               |0.769|20%|
+| + two cols coarsening for PC product                                       |0.664|22%|
+| + two cols coarsening for QC^T product [`QTileK=8`]                        |0.641|24%|
+| + head_dim_v fix :P                                                        |0.566|25%|
+| + `QTileM=CTileN=16` + 4 col coarse PC + O reg tiling + force Ps vec load |*0.440|33%|
+| + avoid Qs bank conflicts + avoid Ps store conditional + full Qr tiling   |*0.404|36%|
+(*excluding splitk reduce kernel)
 
 ## Future works
 

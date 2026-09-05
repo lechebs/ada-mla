@@ -119,39 +119,6 @@ def run_test(mla_func_names: list[str],
             print(f"[{func_name}] seq_len={seq_len} max={max_err:.6g}"
                   f" mean={mean_err:.6g} rel={rel_mean_err:.6f}")
 
-def run_timer_benchmark(mla_func_names: list[callable],
-                        num_heads: int,
-                        seq_lengths: list[int],
-                        head_dim_k: int=HEAD_DIM_K,
-                        dtype: torch.dtype=torch.float32,
-                        num_iters: int=100):
-
-    q = torch.randn(
-        size=(num_heads, head_dim_k), dtype=dtype).to(DEVICE)
-
-    results = []
-
-    for seq_len in seq_lengths:
-        c = torch.randn(
-            size=(seq_len, head_dim_k), dtype=dtype).to(DEVICE)
-
-        for func_name in mla_func_names:
-            func = MLA_DECODE_FUNCS[func_name]
-            func_name_full = f"mla_decode_{func_name.replace("-", "_")}"
-            t = Timer(
-                label=f"seq_len={seq_len}",
-                sub_label=func_name,
-                description="time",
-                stmt=f"{func_name_full}(q, c)",
-                setup=f"from __main__ import {func_name_full}",
-                globals={"q": q, "c": c})
-
-            results.append(t.blocked_autorange())#t.timeit(number=num_iters))
-
-    c = Compare(results)
-    c.colorize()
-    print(c)
-
 def triton_do_bench_mla(seq_len: int,
                         kernel_name: str,
                         dtype: torch.dtype) -> float:
@@ -162,9 +129,9 @@ def triton_do_bench_mla(seq_len: int,
 
     return triton.testing.do_bench(func)
 
-def run_triton_benchmark(kernel_names: list[str],
-                         seq_lengths: list[int],
-                         dtype: torch.dtype=torch.float32):
+def run_benchmark(kernel_names: list[str],
+                  seq_lengths: list[int],
+                  dtype: torch.dtype):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -180,7 +147,7 @@ def run_triton_benchmark(kernel_names: list[str],
     )
     def benchmark(seq_len: int, kernel_name: str):
         return triton_do_bench_mla(seq_len, kernel_name, dtype)
- 
+
     benchmark.run(print_data=True, show_plots=False)
 
 if __name__ == "__main__":
@@ -188,12 +155,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--for-ncu", action="store_true")
     parser.add_argument("--test", action="store_true")
-    parser.add_argument("--timer-bench", action="store_true")
-    parser.add_argument("--triton-bench", action="store_true")
-
+    parser.add_argument("--bench", action="store_true")
 
     parser.add_argument("-s", "--seq-length", type=int, nargs="+",
-                        default=[1024, 4096, 8192, 16384, 32756])
+                        default=[2048, 4096, 8192, 16384, 32768])
 
     parser.add_argument("--fp32", action="store_true")
     # parser.add_argument("--bf16")
@@ -220,18 +185,11 @@ if __name__ == "__main__":
                   dtype=dtype)
 
     if args.test:
-        #funcs = [f for f in chosen_funcs if f != mla_decode_torch]
         run_test(args.kernel,
                  num_heads=NUM_HEADS,
                  seq_lengths=args.seq_length,
                  dtype=dtype)
 
-    if args.timer_bench:
-        run_timer_benchmark(args.kernel,
-                            num_heads=NUM_HEADS,
-                            seq_lengths=args.seq_length,
-                            dtype=dtype)
-
-    if args.triton_bench:
-        run_triton_benchmark(args.kernel, args.seq_length, dtype)
+    if args.bench:
+        run_benchmark(args.kernel, args.seq_length, dtype=dtype)
 
