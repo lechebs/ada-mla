@@ -47,67 +47,67 @@ The `--fp32` flag forces the usage of FP32 precision and inhibits the usage of T
 DeepSeek-V2 MLA replaces the standard MHA keys $k_t$ and values $v_t$ with a joint low-rank compression:
 
 $$
-c_t^{KV} = h_t W_\downarrow^{KV}\quad
-k_t = c_t^{KV} W_\uparrow^K\quad
-v_t = c_t^{KV} W_\uparrow^V
+c_t^{KV} = h_t {W_{\rlap{\downarrow}}}^{KV}\quad
+k_t = c_t^{KV} {W_{\rlap{\uparrow}}}^K\quad
+v_t = c_t^{KV} {W_{\rlap{\uparrow}}}^V
 $$
 
 and similarly, for queries $q_t$:
 
 $$
-c_t^Q = W_\downarrow^Q h_t\quad
-q_t = W_\uparrow^Q c_t^Q
+c_t^Q = {W_{\rlap{\downarrow}}}^Q h_t\quad
+q_t = {W_{\rlap{\uparrow}}}^Q c_t^Q
 $$
 
 where $h_t$ is the $t$-th token of the input sequence, with $q_t$, $k_t$ and $v_t$ row vectors.
 
-Computing attention for each head $i=1,..,n_h$, with $\alpha=1/(d_h + d_h^R)$:
+Computing attention for each head $i=1,\dots,n_h$, with $\alpha=1/(d_h + d_h^R)$:
 
 $$
-o_{t,i}=\sum_{j=1}^N{\textnormal{softmax}(\alpha q_{t,i} k_{j,i}^T)v_{j,i}} 
+o_{t,i}=\sum_{j=1}^N \textnormal{softmax}\left(\alpha q_{t,i} k_{j,i}^T\right)v_{j,i}
 $$
 $$
-=\sum_{j=1}^N{\textnormal{softmax}(\alpha (c_t^Q W_\uparrow^{Q_i})(c_j^{KV} W_\uparrow^{K_i})^T)c_j^{KV} W_\uparrow^{V_i}}
+=\sum_{j=1}^N \textnormal{softmax}\left(\alpha (c_t^Q {W_{\rlap{\uparrow}}}^{Q_i} )(c_j^{KV} {W_{\rlap{\uparrow}}}^{K_i})^T \right)c_j^{KV} {W_{\rlap{\uparrow}}}^{V_i}
 $$
 $$
-=\sum_{j=1}^N{\textnormal{softmax}(\alpha c_t^Q W_\uparrow^{Q_i}(W_\uparrow^{K_i})^T(c_j^{KV})^T)c_j^{KV} W_\uparrow^{V_i}}
+=\sum_{j=1}^N \textnormal{softmax}\left(\alpha c_t^Q {W_{\rlap{\uparrow}}}^{Q_i} ({W_{\rlap{\uparrow}}}^{K_i} )^T(c_j^{KV})^T\right)c_j^{KV} {W_{\rlap{\uparrow}}}^{V_i}
 $$
 
-$W_\uparrow^{K_i}$ can then be absorbed into $W_\uparrow^{Q_i}$, while $W_\uparrow^{V_i}$ can be absorbed into the multi-head $W_O$ projection:
+${W_{\rlap{\uparrow}}}^{K_i}$ can then be absorbed into ${W_{\rlap{\uparrow}}}^{Q_i}$, while ${W_{\rlap{\uparrow}}}^{V_i}$ can be absorbed into the multi-head $W_O$ projection:
 
 $$
-q_{t_i}^\*=\alpha c_t^{Q} W_\uparrow^{Q_i}(W_\uparrow^{K_i})^T
+q_{t,i}^\*=\alpha c_t^Q {W_{\rlap{\uparrow}}}^{Q_i}({W_{\rlap{\uparrow}}}^{K_i})^T
 $$
 $$
-o_{t,i}^\*=\sum_{j=1}^N{\textnormal{softmax}(q_{t,i}^\*(c_j^{KV})^T)c_j^{KV}}
+o_{t,i}^\*=\sum_{j=1}^N \textnormal{softmax}\left(q_{t,i}^\*(c_j^{KV})^T\right)c_j^{KV}
 $$
 $$
-o_{t}=[o_{t,1}; \\dots ; o_{t,n_h}]=[o_{t,1}^\* W_\uparrow^{V_1}; \dots ; o_{t,n_h}^\* W_\uparrow^{V_{n_h}}]W_O=[o_{t,1}^\*; \dots ; o_{t,n_h}^\*]W_O^*
+o_t=[o_{t,1}; \dots ; o_{t,n_h}]W_O=[o_{t,1}^\* {W_{\rlap{\uparrow}}}^{V_1}; \dots ; o_{t,n_h}^\* {W_{\rlap{\uparrow}}}^{V_{n_h}}]W_O=[o_{t,1}^\*; \dots ; o_{t,n_h}^\*]W_O^\*
 $$
 
 with $;$ indicating row-wise concatenation. Note that thanks to the absorption trick, queries from different heads are multiplied against the same latent KV vectors, which brings to the matrix form:
 
 $$
-O = \textnormal{softmax}(Q^\*C^T)C W^\*_O
+O = \textnormal{softmax}\left(Q^\*C^T\right)C W^\*_O
 $$
 
 The derivation considering explicit decoupled RoPE leads to a slightly different formulation, see DeepSeek-V2 paper for the full math:
 
 $$
-\tilde{O} = \textnormal{softmax}(Q^\*C^T)C_N \tilde{W}^\*_O
+\tilde{O} = \textnormal{softmax}\left(Q^\*C^T\right)C_N \tilde{W}^\*_O
 $$
 
 where $Q^\* \in \mathbf{R}^{n_n\times 576}$, $C \in \mathbf{R}^{N\times 576} = [C_N \quad C_R]$ and $C_N\in\mathbf{R}^{N\times 512}$, with $n_h=128$, $h_d=128$, $h_d^R=64$.
 
 ### MLA decode
 
-In practice, when decoding, the compressed query is first projected for each head by $W_\uparrow^{Q_i}(W_\uparrow^{K_i})^T$, the results are stacked into the matrix $Q^*$, and the actual computation done by the MLA kernel strictly becomes:
+In practice, when decoding, the compressed query is first projected for each head by ${W_{\rlap{\uparrow}}}^{Q_i}({W_{\rlap{\uparrow}}}^{K_i})^T$, the results are stacked into the matrix $Q^*$, and the actual computation done by the MLA kernel strictly becomes:
 
 $$
-O^\* = \textnormal{softmax}(Q^\*C^T)C_N
+O^\* = \textnormal{softmax}\left(Q^\*C^T\right)C_N
 $$
 
-where $O^\*\in \mathbf{R}^{n_h\times 512}$. The final projection by $\tilde{W}^\*_O$ is then carried out separately. 
+where $O^\*\in \mathbf{R}^{n_h\times 512}$. The final projection by $\tilde{W}^\*_O$ is then carried out separately.
 
 ### Online softmax
 
